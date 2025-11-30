@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
+use rustrtc::IceServer;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use webrtc::ice_transport::ice_server::RTCIceServer;
 
 use crate::cli::Cli;
 
@@ -22,12 +22,12 @@ impl Default for IceServerConfig {
     }
 }
 
-impl From<IceServerConfig> for RTCIceServer {
+impl From<IceServerConfig> for IceServer {
     fn from(config: IceServerConfig) -> Self {
-        RTCIceServer {
+        IceServer {
             urls: config.urls,
-            username: config.username.unwrap_or_default(),
-            credential: config.credential.unwrap_or_default(),
+            username: config.username,
+            credential: config.credential,
             ..Default::default()
         }
     }

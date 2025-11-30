@@ -2,6 +2,8 @@
 
 RPort is a modern, WebRTC-based remote port forwarding tool written in Rust. It enables secure peer-to-peer connections for port forwarding, remote access, and network tunneling without requiring complex NAT traversal configurations.
 
+It is built on top of [rustrtc](https://github.com/restsend/rustrtc), a pure Rust WebRTC implementation.
+
 ## Features
 
 - 🚀 **WebRTC-based P2P connections** - Direct peer-to-peer tunneling

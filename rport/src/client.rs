@@ -1,22 +1,108 @@
 use anyhow::{anyhow, Result};
-use bytes::Bytes;
 use reqwest::Client;
 use rport_common::*;
+use rustrtc::{
+    transports::sctp::{DataChannel, DataChannelConfig, DataChannelEvent},
+    PeerConnection, PeerConnectionEvent, SdpType, SessionDescription,
+};
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info};
-use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::config::IceServerConfig;
-use crate::sdp_utils::strip_ipv6_candidates;
 use crate::webrtc_config::WebRTCConfig;
+
+pub async fn forward_stream_to_webrtc<R, W>(
+    peer_connection: Arc<PeerConnection>,
+    data_channel: Arc<DataChannel>,
+    mut input: R,
+    mut output: W,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    // Wait for data channel open
+    // We need to spawn a task to consume events from data channel to detect Open
+    let (open_tx, open_rx) = tokio::sync::oneshot::channel();
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let dc_clone = data_channel.clone();
+    tokio::spawn(async move {
+        let mut open_tx = Some(open_tx);
+        while let Some(event) = dc_clone.recv().await {
+            match event {
+                DataChannelEvent::Open => {
+                    if let Some(tx) = open_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                DataChannelEvent::Message(data) => {
+                    let _ = msg_tx.send(data);
+                }
+                DataChannelEvent::Close => {
+                    break;
+                }
+            }
+        }
+    });
+
+    open_rx.await?;
+
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    // Set up input -> WebRTC forwarding
+    let pc_clone = peer_connection.clone();
+    let dc_id = data_channel.id;
+
+    let input_task = async move {
+        let mut buffer = [0u8; 1024];
+
+        loop {
+            match input.read(&mut buffer).await {
+                Ok(0) => {
+                    // input closed - exit silently
+                    break;
+                }
+                Ok(n) => {
+                    let data = &buffer[..n];
+                    if pc_clone.send_data(dc_id, data).await.is_err() {
+                        // WebRTC send failed - exit silently
+                        break;
+                    }
+                }
+                Err(_) => {
+                    // input read failed - exit silently
+                    break;
+                }
+            }
+        }
+    };
+
+    // Set up WebRTC -> output forwarding
+    let output_task = tokio::spawn(async move {
+        while let Some(data) = msg_rx.recv().await {
+            if output.write_all(&data).await.is_err() {
+                // output write failed - exit silently
+                break;
+            }
+            if output.flush().await.is_err() {
+                // output flush failed - exit silently
+                break;
+            }
+        }
+    });
+
+    // Wait for either task to complete (silently)
+    tokio::select! {
+        _ = cancel_token.cancelled() => {}
+        _ = input_task => {}
+        _ = output_task => {}
+    }
+
+    Ok(())
+}
 
 pub struct CliClient {
     server_url: String,
@@ -52,67 +138,15 @@ impl CliClient {
             self.create_webrtc_connection_silent(&agent_id).await?;
 
         // Wait for connection to be established (silently)
-        self.wait_for_peer_connection_connected_silent(&peer_connection)
-            .await?;
-        self.wait_for_data_channel_open_silent(&data_channel)
-            .await?;
-        let cancel_token = tokio_util::sync::CancellationToken::new();
-        // Set up stdin -> WebRTC forwarding
-        let data_channel_write = data_channel.clone();
-        let stdin_task = async move {
-            let mut stdin = tokio::io::stdin();
-            let mut buffer = [0u8; 4096];
+        peer_connection.wait_for_connection().await?;
 
-            loop {
-                match stdin.read(&mut buffer).await {
-                    Ok(0) => {
-                        // stdin closed - exit silently
-                        break;
-                    }
-                    Ok(n) => {
-                        let data = Bytes::from(buffer[..n].to_vec());
-                        if data_channel_write.send(&data).await.is_err() {
-                            // WebRTC send failed - exit silently
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        // stdin read failed - exit silently
-                        break;
-                    }
-                }
-            }
-        };
-
-        // Set up WebRTC -> stdout forwarding
-        let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel();
-        data_channel.on_message(Box::new(move |msg| {
-            let stdout_tx = stdout_tx.clone();
-            Box::pin(async move {
-                let _ = stdout_tx.send(msg.data); // Ignore errors silently
-            })
-        }));
-
-        let stdout_task = tokio::spawn(async move {
-            let mut stdout = tokio::io::stdout();
-            while let Some(data) = stdout_rx.recv().await {
-                if stdout.write_all(&data).await.is_err() {
-                    // stdout write failed - exit silently
-                    break;
-                }
-                if stdout.flush().await.is_err() {
-                    // stdout flush failed - exit silently
-                    break;
-                }
-            }
-        });
-
-        // Wait for either task to complete (silently)
-        tokio::select! {
-            _ = cancel_token.cancelled() => {}
-            _ = stdin_task => {}
-            _ = stdout_task => {}
-        }
+        forward_stream_to_webrtc(
+            peer_connection,
+            data_channel,
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+        )
+        .await?;
 
         Ok(())
     }
@@ -151,20 +185,59 @@ impl CliClient {
         // Create WebRTC connection for this TCP connection
         let (peer_connection, data_channel) = self.create_webrtc_connection(&agent_id).await?;
 
+        // Spawn a task to keep the peer connection alive and process events
+        let pc_clone = peer_connection.clone();
+        tokio::spawn(async move {
+            while let Some(event) = pc_clone.recv().await {
+                tracing::info!("CliClient PC Event received");
+                if let PeerConnectionEvent::DataChannel(_) = event {
+                    tracing::info!("CliClient PC Event: DataChannel (unexpected)");
+                }
+            }
+        });
+
         // Wait for connection to be established
-        self.wait_for_peer_connection_connected(&peer_connection)
-            .await?;
-        self.wait_for_data_channel_open(&data_channel).await?;
+        peer_connection.wait_for_connection().await?;
+
+        // Wait for data channel open and handle messages
+        let (open_tx, open_rx) = tokio::sync::oneshot::channel();
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let dc_clone = data_channel.clone();
+        tokio::spawn(async move {
+            let mut open_tx = Some(open_tx);
+            while let Some(event) = dc_clone.recv().await {
+                tracing::info!("CliClient DC Event received");
+                match event {
+                    DataChannelEvent::Open => {
+                        tracing::info!("CliClient DC Open");
+                        if let Some(tx) = open_tx.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    DataChannelEvent::Message(data) => {
+                        let _ = msg_tx.send(data);
+                    }
+                    DataChannelEvent::Close => {
+                        tracing::info!("CliClient DC Close");
+                        break;
+                    }
+                }
+            }
+        });
+
+        open_rx.await?;
 
         info!("WebRTC connection established for TCP client");
 
         // Split the TCP stream
         let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
 
-        let data_channel_write = data_channel.clone();
+        let pc_clone = peer_connection.clone();
+        let dc_id = data_channel.id;
 
         let tcp_to_webrtc = async move {
-            let mut buffer = [0u8; 4096];
+            let mut buffer = [0u8; 1024];
 
             loop {
                 match tcp_read.read(&mut buffer).await {
@@ -173,8 +246,8 @@ impl CliClient {
                         break;
                     }
                     Ok(n) => {
-                        let data = Bytes::from(buffer[..n].to_vec());
-                        if let Err(e) = data_channel_write.send(&data).await {
+                        let data = &buffer[..n];
+                        if let Err(e) = pc_clone.send_data(dc_id, data).await {
                             error!("Failed to send data through WebRTC: {}", e);
                             break;
                         }
@@ -188,18 +261,8 @@ impl CliClient {
         };
 
         // Set up WebRTC -> TCP forwarding
-        let (webrtc_tx, mut webrtc_rx) = tokio::sync::mpsc::unbounded_channel();
-        data_channel.on_message(Box::new(move |msg| {
-            let webrtc_tx = webrtc_tx.clone();
-            Box::pin(async move {
-                if let Err(e) = webrtc_tx.send(msg.data) {
-                    error!("Failed to send message to TCP channel: {}", e);
-                }
-            })
-        }));
-
         let webrtc_to_tcp = async move {
-            while let Some(data) = webrtc_rx.recv().await {
+            while let Some(data) = msg_rx.recv().await {
                 if let Err(e) = tcp_write.write_all(&data).await {
                     error!("Failed to write to TCP: {}", e);
                     break;
@@ -227,50 +290,36 @@ impl CliClient {
     async fn create_webrtc_connection(
         &self,
         agent_id: &str,
-    ) -> Result<(Arc<RTCPeerConnection>, Arc<RTCDataChannel>)> {
+    ) -> Result<(Arc<PeerConnection>, Arc<DataChannel>)> {
         info!("Creating WebRTC peer connection for agent: {}", agent_id);
 
         // Create WebRTC peer connection
         let peer_connection = self.create_peer_connection().await?;
 
-        peer_connection.on_peer_connection_state_change(Box::new(
-            move |s: RTCPeerConnectionState| {
-                info!("Peer Connection State has changed: {}", s);
-                Box::pin(async move {})
-            },
-        ));
-
         // Create a data channel before creating the offer
-        let data_channel_config = RTCDataChannelInit {
-            ordered: Some(true),
+        let data_channel_config = DataChannelConfig {
+            ordered: true,
             max_retransmits: Some(10),
             ..Default::default()
         };
-        let data_channel = peer_connection
-            .create_data_channel("port-forward", Some(data_channel_config))
-            .await?;
+        let data_channel =
+            peer_connection.create_data_channel("port-forward", Some(data_channel_config))?;
+
         // Create offer
-        let offer = peer_connection.create_offer(None).await?;
-        peer_connection.set_local_description(offer.clone()).await?;
+        let offer = peer_connection.create_offer().await?;
+        peer_connection.set_local_description(offer.clone())?;
 
         // Wait for ICE gathering
-        peer_connection
-            .gathering_complete_promise()
-            .await
-            .recv()
-            .await;
+        peer_connection.wait_for_gathering_complete().await;
 
         let offer = peer_connection
             .local_description()
-            .await
             .ok_or_else(|| anyhow!("Failed to get local description after ICE gathering"))?;
-
-        // Strip IPv6 candidates from offer
-        let filtered_offer_sdp = strip_ipv6_candidates(&offer.sdp);
+        let offer_sdp = offer.to_sdp_string();
         // Send offer to server
         let offer_msg = OfferMessage {
             id: agent_id.to_string(),
-            offer: filtered_offer_sdp,
+            offer: offer_sdp,
         };
 
         let url = format!("{}/rport/offer?token={}", self.server_url, self.token);
@@ -285,11 +334,8 @@ impl CliClient {
             .as_str()
             .ok_or_else(|| anyhow!("Missing answer in response"))?;
 
-        // Strip IPv6 candidates from answer
-        let filtered_answer_sdp = strip_ipv6_candidates(answer_sdp);
-
         // Set remote description from answer
-        let answer = RTCSessionDescription::answer(filtered_answer_sdp)?;
+        let answer = SessionDescription::parse(SdpType::Answer, &answer_sdp)?;
         peer_connection.set_remote_description(answer).await?;
 
         info!("WebRTC handshake completed successfully");
@@ -300,44 +346,36 @@ impl CliClient {
     async fn create_webrtc_connection_silent(
         &self,
         agent_id: &str,
-    ) -> Result<(Arc<RTCPeerConnection>, Arc<RTCDataChannel>)> {
+    ) -> Result<(Arc<PeerConnection>, Arc<DataChannel>)> {
         // Silent version for ProxyCommand mode - no logging
 
         // Create WebRTC peer connection
         let peer_connection = self.create_peer_connection().await?;
 
         // Create a data channel before creating the offer
-        let data_channel_config = RTCDataChannelInit {
-            ordered: Some(true),
+        let data_channel_config = DataChannelConfig {
+            ordered: true,
             ..Default::default()
         };
-        let data_channel = peer_connection
-            .create_data_channel("port-forward", Some(data_channel_config))
-            .await?;
-
+        let data_channel =
+            peer_connection.create_data_channel("port-forward", Some(data_channel_config))?;
         // Create offer
-        let offer = peer_connection.create_offer(None).await?;
-        peer_connection.set_local_description(offer.clone()).await?;
+        let offer = peer_connection.create_offer().await?;
+        peer_connection.set_local_description(offer.clone())?;
 
         // Wait for ICE gathering
-        peer_connection
-            .gathering_complete_promise()
-            .await
-            .recv()
-            .await;
+        peer_connection.wait_for_gathering_complete().await;
 
         let offer = peer_connection
             .local_description()
-            .await
             .ok_or_else(|| anyhow!("Failed to get local description after ICE gathering"))?;
 
         // Strip IPv6 candidates from offer
-        let filtered_offer_sdp = strip_ipv6_candidates(&offer.sdp);
-
+        let offer_sdp = offer.to_sdp_string();
         // Send offer to server
         let offer_msg = OfferMessage {
             id: agent_id.to_string(),
-            offer: filtered_offer_sdp,
+            offer: offer_sdp,
         };
 
         let url = format!("{}/rport/offer?token={}", self.server_url, self.token);
@@ -352,130 +390,15 @@ impl CliClient {
             .as_str()
             .ok_or_else(|| anyhow!("Missing answer in response"))?;
 
-        // Strip IPv6 candidates from answer
-        let filtered_answer_sdp = strip_ipv6_candidates(answer_sdp);
-
         // Set remote description from answer
-        let answer = RTCSessionDescription::answer(filtered_answer_sdp)?;
+        let answer = SessionDescription::parse(SdpType::Answer, &answer_sdp)?;
         peer_connection.set_remote_description(answer).await?;
 
         Ok((peer_connection, data_channel))
     }
 
-    async fn create_peer_connection(&self) -> Result<Arc<RTCPeerConnection>> {
+    async fn create_peer_connection(&self) -> Result<Arc<PeerConnection>> {
         self.webrtc_config.create_peer_connection().await
-    }
-
-    async fn wait_for_peer_connection_connected(
-        &self,
-        peer_connection: &Arc<RTCPeerConnection>,
-    ) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
-
-        let tx_clone = Arc::clone(&tx);
-        peer_connection.on_peer_connection_state_change(Box::new(move |state| {
-            let tx = Arc::clone(&tx_clone);
-            Box::pin(async move {
-                info!("Peer connection state changed: {:?}", state);
-                if state == RTCPeerConnectionState::Connected {
-                    if let Some(sender) = tx.lock().await.take() {
-                        let _ = sender.send(());
-                    }
-                }
-            })
-        }));
-
-        // Wait for connection with timeout
-        tokio::select! {
-            _ = rx => {
-                info!("Peer connection established successfully");
-                Ok(())
-            }
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                Err(anyhow!("Timeout waiting for peer connection to connect"))
-            }
-        }
-    }
-
-    async fn wait_for_data_channel_open(&self, data_channel: &Arc<RTCDataChannel>) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
-
-        let tx_clone = Arc::clone(&tx);
-        data_channel.on_open(Box::new(move || {
-            let tx = Arc::clone(&tx_clone);
-            Box::pin(async move {
-                if let Some(sender) = tx.lock().await.take() {
-                    let _ = sender.send(());
-                }
-            })
-        }));
-
-        // Wait with timeout
-        tokio::select! {
-            _ = rx => {
-                info!("Data channel opened successfully");
-                Ok(())
-            }
-            _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                Err(anyhow!("Timeout waiting for data channel to open"))
-            }
-        }
-    }
-
-    async fn wait_for_peer_connection_connected_silent(
-        &self,
-        peer_connection: &Arc<RTCPeerConnection>,
-    ) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
-
-        let tx_clone = Arc::clone(&tx);
-        peer_connection.on_peer_connection_state_change(Box::new(move |state| {
-            let tx = Arc::clone(&tx_clone);
-            Box::pin(async move {
-                if state == RTCPeerConnectionState::Connected {
-                    if let Some(sender) = tx.lock().await.take() {
-                        let _ = sender.send(());
-                    }
-                }
-            })
-        }));
-
-        // Wait for connection with timeout (silently)
-        tokio::select! {
-            _ = rx => Ok(()),
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                Err(anyhow!("Timeout waiting for peer connection to connect"))
-            }
-        }
-    }
-
-    async fn wait_for_data_channel_open_silent(
-        &self,
-        data_channel: &Arc<RTCDataChannel>,
-    ) -> Result<()> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
-
-        let tx_clone = Arc::clone(&tx);
-        data_channel.on_open(Box::new(move || {
-            let tx = Arc::clone(&tx_clone);
-            Box::pin(async move {
-                if let Some(sender) = tx.lock().await.take() {
-                    let _ = sender.send(());
-                }
-            })
-        }));
-
-        // Wait with timeout (silently)
-        tokio::select! {
-            _ = rx => Ok(()),
-            _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                Err(anyhow!("Timeout waiting for data channel to open"))
-            }
-        }
     }
 }
 

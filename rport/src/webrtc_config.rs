@@ -1,10 +1,7 @@
 use anyhow::Result;
 use reqwest::Client;
+use rustrtc::{IceServer, PeerConnection, RtcConfiguration};
 use std::sync::Arc;
-use webrtc::api::APIBuilder;
-use webrtc::ice_transport::ice_server::RTCIceServer;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::config::IceServerConfig;
 
@@ -24,7 +21,7 @@ impl WebRTCConfig {
         }
     }
 
-    pub async fn get_ice_servers(&self) -> Vec<RTCIceServer> {
+    pub async fn get_ice_servers(&self) -> Vec<IceServer> {
         if self.ice_servers.len() > 0 {
             return self
                 .ice_servers
@@ -44,20 +41,21 @@ impl WebRTCConfig {
         if !response.status().is_success() {
             return vec![IceServerConfig::default().into()];
         }
-        response
+        let ice_servers: Vec<IceServer> = response
             .json::<Vec<IceServerConfig>>()
             .await
             .map(|configs| configs.into_iter().map(|c| c.into()).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        ice_servers
     }
 
-    pub async fn create_peer_connection(&self) -> Result<Arc<RTCPeerConnection>> {
-        let api = APIBuilder::new().build();
-        let config = RTCConfiguration {
-            ice_servers: self.get_ice_servers().await,
+    pub async fn create_peer_connection(&self) -> Result<Arc<PeerConnection>> {
+        let ice_servers = self.get_ice_servers().await;
+        let config = RtcConfiguration {
+            ice_servers,
             ..Default::default()
         };
-        let peer_connection = Arc::new(api.new_peer_connection(config).await?);
+        let peer_connection = Arc::new(PeerConnection::new(config));
         Ok(peer_connection)
     }
 }

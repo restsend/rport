@@ -5,7 +5,6 @@ mod client;
 mod config;
 #[cfg(unix)]
 mod daemon;
-mod sdp_utils;
 mod webrtc_config;
 
 use agent::Agent;
@@ -72,11 +71,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // In daemon mode, logs will be written to the log file
     use tracing_subscriber::{self, filter::EnvFilter};
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(
-            "rport=info,turn=warn,webrtc=warn,webrtc_ice=error",
-        ))
+        .with_env_filter(EnvFilter::new("rport=warn,turn=warn,rustrtc=warn"))
         .init();
-
     if let Some(target) = config.target {
         // Agent mode
         let (host, port) = parse_target(&target)?;

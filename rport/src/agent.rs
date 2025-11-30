@@ -3,6 +3,10 @@ use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::Client;
 use rport_common::{AnswerMessage, ServerMessage, RECONNECT_INTERVAL};
+use rustrtc::{
+    transports::sctp::DataChannelEvent, PeerConnection, PeerConnectionEvent, SdpType,
+    SessionDescription,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,19 +14,15 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::config::IceServerConfig;
-use crate::sdp_utils::strip_ipv6_candidates;
 use crate::webrtc_config::WebRTCConfig;
 
 #[allow(dead_code)]
 struct ConnectionSession {
     session_id: Uuid,
     client_ip: String,
-    peer_connection: Arc<RTCPeerConnection>,
+    peer_connection: Arc<PeerConnection>,
 }
 
 pub struct Agent {
@@ -184,95 +184,87 @@ impl Agent {
         );
 
         let peer_connection = self.create_peer_connection().await?;
-
-        // Strip IPv6 candidates from incoming offer
-        let filtered_offer_sdp = strip_ipv6_candidates(offer_sdp);
-
         // Set remote description first
-        let offer = RTCSessionDescription::offer(filtered_offer_sdp)?;
+        let offer = SessionDescription::parse(SdpType::Offer, &offer_sdp)?;
         peer_connection.set_remote_description(offer).await?;
 
         // Set up data channel handler
         let target_host = self.target_host.clone();
         let target_port = self.target_port;
         let client_ip = client_ip.to_string();
+        let pc_clone = peer_connection.clone();
 
-        peer_connection.on_data_channel(Box::new(move |data_channel| {
-            let target_host = target_host.clone();
-            let target_port = target_port;
-            let data_channel_clone = data_channel.clone();
-            let client_ip_clone = client_ip.clone();
-            let cancel_token = tokio_util::sync::CancellationToken::new();
-            let (tcp_write_tx, tcp_write_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(event) = pc_clone.recv().await {
+                match event {
+                    PeerConnectionEvent::DataChannel(data_channel) => {
+                        let target_host = target_host.clone();
+                        let target_port = target_port;
+                        let client_ip = client_ip.clone();
+                        let pc_for_tcp = pc_clone.clone();
+                        let dc_id = data_channel.id;
 
-            data_channel.on_message(Box::new(move |msg| {
-                let tcp_write_tx_clone = tcp_write_tx.clone();
-                Box::pin(async move {
-                    tcp_write_tx_clone.send(msg.data).ok();
-                })
-            }));
+                        tokio::spawn(async move {
+                            let cancel_token = tokio_util::sync::CancellationToken::new();
+                            let (tcp_write_tx, tcp_write_rx) = mpsc::unbounded_channel();
+                            let mut tcp_write_rx = Some(tcp_write_rx);
 
-            data_channel.on_close(Box::new({
-                let cancel_token_ref = cancel_token.clone();
-                move || {
-                    let cancel_token = cancel_token_ref.clone();
-                    Box::pin(async move {
-                        info!("Data channel closed, cancelling forwarding");
-                        cancel_token.cancel();
-                    })
+                            while let Some(dc_event) = data_channel.recv().await {
+                                match dc_event {
+                                    DataChannelEvent::Open => {
+                                        if let Some(rx) = tcp_write_rx.take() {
+                                            let target_host = target_host.clone();
+                                            let client_ip = client_ip.clone();
+                                            let pc = pc_for_tcp.clone();
+                                            let cancel_token = cancel_token.clone();
+
+                                            tokio::spawn(async move {
+                                                tcp_webrtc_forwarding(
+                                                    cancel_token,
+                                                    rx,
+                                                    client_ip,
+                                                    pc,
+                                                    dc_id,
+                                                    &target_host,
+                                                    target_port,
+                                                )
+                                                .await
+                                                .ok();
+                                            });
+                                        }
+                                    }
+                                    DataChannelEvent::Message(data) => {
+                                        let _ = tcp_write_tx.send(Bytes::from(data));
+                                    }
+                                    DataChannelEvent::Close => {
+                                        info!("Data channel closed, cancelling forwarding");
+                                        cancel_token.cancel();
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    _ => {}
                 }
-            }));
-
-            data_channel.on_open(Box::new(move || {
-                let target_host = target_host.clone();
-                let target_port = target_port;
-                let data_channel = Arc::clone(&data_channel_clone);
-                let client_ip_clone = client_ip_clone.clone();
-                Box::pin(async move {
-                    // Start TCP forwarding
-                    tokio::spawn(async move {
-                        tcp_webrtc_forwarding(
-                            cancel_token,
-                            tcp_write_rx,
-                            client_ip_clone,
-                            data_channel,
-                            &target_host,
-                            target_port,
-                        )
-                        .await
-                        .ok();
-                    });
-                })
-            }));
-            Box::pin(async move {})
-        }));
+            }
+        });
 
         // Create answer
-        let answer = peer_connection.create_answer(None).await?;
-        peer_connection
-            .set_local_description(answer.clone())
-            .await?;
+        let answer = peer_connection.create_answer().await?;
+        peer_connection.set_local_description(answer.clone())?;
 
         // Wait for ICE gathering to complete
-        peer_connection
-            .gathering_complete_promise()
-            .await
-            .recv()
-            .await;
+        peer_connection.wait_for_gathering_complete().await;
 
         let answer_sdp = peer_connection
             .local_description()
-            .await
             .ok_or_else(|| anyhow!("Failed to get local description"))?
-            .sdp;
-
-        // Strip IPv6 candidates from answer
-        let filtered_answer_sdp = strip_ipv6_candidates(&answer_sdp);
-
-        Ok(filtered_answer_sdp)
+            .to_sdp_string();
+        Ok(answer_sdp)
     }
 
-    async fn create_peer_connection(&self) -> Result<Arc<RTCPeerConnection>> {
+    async fn create_peer_connection(&self) -> Result<Arc<PeerConnection>> {
         self.webrtc_config.create_peer_connection().await
     }
 }
@@ -281,7 +273,8 @@ async fn tcp_webrtc_forwarding(
     cancel_token: tokio_util::sync::CancellationToken,
     mut tcp_write_rx: mpsc::UnboundedReceiver<Bytes>,
     client_ip: String,
-    data_channel: Arc<RTCDataChannel>,
+    peer_connection: Arc<PeerConnection>,
+    channel_id: u16,
     target_host: &str,
     target_port: u16,
 ) -> Result<()> {
@@ -307,7 +300,7 @@ async fn tcp_webrtc_forwarding(
 
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
     let recv_from_tcp = async {
-        let mut buffer = [0u8; 4096];
+        let mut buffer = [0u8; 1024];
         loop {
             match tcp_read.read(&mut buffer).await {
                 Ok(0) => {
@@ -315,8 +308,8 @@ async fn tcp_webrtc_forwarding(
                     break;
                 }
                 Ok(n) => {
-                    let data = Bytes::from(buffer[..n].to_vec());
-                    if let Err(e) = data_channel.send(&data).await {
+                    let data = &buffer[..n];
+                    if let Err(e) = peer_connection.send_data(channel_id, data).await {
                         error!("Failed to send data through WebRTC: {}", e);
                         break;
                     }
