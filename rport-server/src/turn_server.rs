@@ -122,6 +122,13 @@ impl TurnServer {
             None => format!("turn:{}", self.listen_addr),
         }
     }
+    pub fn get_stun_url(&self) -> String {
+        let port = self.listen_addr.port();
+        match &self.public_ip {
+            Some(ip) => format!("stun:{}:{}", ip, port),
+            None => format!("stun:{}", self.listen_addr),
+        }
+    }
 
     /// Close the TURN server
     pub async fn close(&self) -> Result<()> {

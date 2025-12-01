@@ -540,7 +540,9 @@ pub mod tests {
             negotiated: Some(0),
             ..Default::default()
         };
-        let dc = agent_pc.create_data_channel("port-forward", Some(dc_config)).unwrap();
+        let dc = agent_pc
+            .create_data_channel("port-forward", Some(dc_config))
+            .unwrap();
 
         // We need to drain events from agent_pc to make sure the connection progresses
         let agent_pc_clone = agent_pc.clone();
@@ -563,8 +565,9 @@ pub mod tests {
                 }
             }
         });
-        
+
         tokio::time::timeout(Duration::from_secs(5), open_rx).await??;
-        info!("DataChannel Open!");        Ok(())
+        info!("DataChannel Open!");
+        Ok(())
     }
 }

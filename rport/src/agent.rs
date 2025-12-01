@@ -3,10 +3,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::Client;
 use rport_common::{AnswerMessage, ServerMessage, RECONNECT_INTERVAL};
-use rustrtc::{
-    transports::sctp::DataChannelEvent, PeerConnection, SdpType,
-    SessionDescription,
-};
+use rustrtc::{transports::sctp::DataChannelEvent, PeerConnection, SdpType, SessionDescription};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
