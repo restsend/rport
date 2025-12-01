@@ -254,7 +254,7 @@ pub async fn get_iceservers(State(state): State<AppState>) -> impl IntoResponse 
     // Generate temporary TURN credentials
 
     let mut ice_servers = vec![serde_json::json!({
-        "urls": [state.turn_server.get_turn_url()]
+        "urls": [state.turn_server.get_stun_url()]
     })];
 
     match state.turn_server.generate_credentials().await {
