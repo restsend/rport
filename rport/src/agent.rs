@@ -4,7 +4,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use rport_common::{AnswerMessage, ServerMessage, RECONNECT_INTERVAL};
 use rustrtc::{
-    transports::sctp::DataChannelEvent, PeerConnection, PeerConnectionEvent, SdpType,
+    transports::sctp::DataChannelEvent, PeerConnection, SdpType,
     SessionDescription,
 };
 use std::sync::Arc;
@@ -184,6 +184,17 @@ impl Agent {
         );
 
         let peer_connection = self.create_peer_connection().await?;
+
+        // Create negotiated data channel
+        use rustrtc::transports::sctp::DataChannelConfig;
+        let dc_config = DataChannelConfig {
+            ordered: true,
+            max_retransmits: Some(10),
+            negotiated: Some(0),
+            ..Default::default()
+        };
+        let data_channel = peer_connection.create_data_channel("port-forward", Some(dc_config))?;
+
         // Set remote description first
         let offer = SessionDescription::parse(SdpType::Offer, &offer_sdp)?;
         peer_connection.set_remote_description(offer).await?;
@@ -193,60 +204,56 @@ impl Agent {
         let target_port = self.target_port;
         let client_ip = client_ip.to_string();
         let pc_clone = peer_connection.clone();
+        let dc_clone = data_channel.clone();
+        let dc_id = data_channel.id;
 
+        // Handle DataChannel events
         tokio::spawn(async move {
-            while let Some(event) = pc_clone.recv().await {
-                match event {
-                    PeerConnectionEvent::DataChannel(data_channel) => {
-                        let target_host = target_host.clone();
-                        let target_port = target_port;
-                        let client_ip = client_ip.clone();
-                        let pc_for_tcp = pc_clone.clone();
-                        let dc_id = data_channel.id;
+            let cancel_token = tokio_util::sync::CancellationToken::new();
+            let (tcp_write_tx, tcp_write_rx) = mpsc::unbounded_channel();
+            let mut tcp_write_rx = Some(tcp_write_rx);
 
-                        tokio::spawn(async move {
-                            let cancel_token = tokio_util::sync::CancellationToken::new();
-                            let (tcp_write_tx, tcp_write_rx) = mpsc::unbounded_channel();
-                            let mut tcp_write_rx = Some(tcp_write_rx);
+            while let Some(dc_event) = dc_clone.recv().await {
+                match dc_event {
+                    DataChannelEvent::Open => {
+                        if let Some(rx) = tcp_write_rx.take() {
+                            let target_host = target_host.clone();
+                            let client_ip = client_ip.clone();
+                            let pc = pc_clone.clone();
+                            let cancel_token = cancel_token.clone();
 
-                            while let Some(dc_event) = data_channel.recv().await {
-                                match dc_event {
-                                    DataChannelEvent::Open => {
-                                        if let Some(rx) = tcp_write_rx.take() {
-                                            let target_host = target_host.clone();
-                                            let client_ip = client_ip.clone();
-                                            let pc = pc_for_tcp.clone();
-                                            let cancel_token = cancel_token.clone();
-
-                                            tokio::spawn(async move {
-                                                tcp_webrtc_forwarding(
-                                                    cancel_token,
-                                                    rx,
-                                                    client_ip,
-                                                    pc,
-                                                    dc_id,
-                                                    &target_host,
-                                                    target_port,
-                                                )
-                                                .await
-                                                .ok();
-                                            });
-                                        }
-                                    }
-                                    DataChannelEvent::Message(data) => {
-                                        let _ = tcp_write_tx.send(Bytes::from(data));
-                                    }
-                                    DataChannelEvent::Close => {
-                                        info!("Data channel closed, cancelling forwarding");
-                                        cancel_token.cancel();
-                                        break;
-                                    }
-                                }
-                            }
-                        });
+                            tokio::spawn(async move {
+                                tcp_webrtc_forwarding(
+                                    cancel_token,
+                                    rx,
+                                    client_ip,
+                                    pc,
+                                    dc_id,
+                                    &target_host,
+                                    target_port,
+                                )
+                                .await
+                                .ok();
+                            });
+                        }
                     }
-                    _ => {}
+                    DataChannelEvent::Message(data) => {
+                        let _ = tcp_write_tx.send(Bytes::from(data));
+                    }
+                    DataChannelEvent::Close => {
+                        info!("Data channel closed, cancelling forwarding");
+                        cancel_token.cancel();
+                        break;
+                    }
                 }
+            }
+        });
+
+        // Drain PeerConnection events
+        let pc_clone_drain = peer_connection.clone();
+        tokio::spawn(async move {
+            while let Some(_) = pc_clone_drain.recv().await {
+                // drain
             }
         });
 

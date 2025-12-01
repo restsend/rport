@@ -300,6 +300,7 @@ impl CliClient {
         let data_channel_config = DataChannelConfig {
             ordered: true,
             max_retransmits: Some(10),
+            negotiated: Some(0),
             ..Default::default()
         };
         let data_channel =
@@ -410,5 +411,160 @@ impl Clone for CliClient {
             client: Client::new(),
             webrtc_config: self.webrtc_config.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use rport_common::{OfferMessage, ServerMessage};
+    use rustrtc::{IceServer, PeerConnection, RtcConfiguration};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn test_connect_port_forward_integration() -> Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("debug")
+            .try_init();
+
+        // Setup "Agent" side WebRTC
+        let config = RtcConfiguration::default();
+        let agent_pc = Arc::new(PeerConnection::new(config));
+
+        // Setup Mock Signaling Server
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let local_addr = listener.local_addr()?;
+        let server_url = format!("http://{}", local_addr);
+
+        let agent_pc_clone = agent_pc.clone();
+
+        // Spawn the mock server
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(_) => break,
+                };
+
+                let agent_pc = agent_pc_clone.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let n = match socket.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+
+                    let req = String::from_utf8_lossy(&buf[..n]);
+
+                    if req.contains("GET /rport/iceservers") {
+                        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n[]";
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                        return;
+                    }
+
+                    if req.contains("POST /rport/offer") {
+                        // Find body
+                        if let Some(idx) = req.find("\r\n\r\n") {
+                            let body = &req[idx + 4..];
+
+                            if let Ok(offer_msg) = serde_json::from_str::<OfferMessage>(body) {
+                                // Handle WebRTC negotiation
+                                let offer =
+                                    SessionDescription::parse(SdpType::Offer, &offer_msg.offer)
+                                        .unwrap();
+                                agent_pc.set_remote_description(offer).await.unwrap();
+
+                                let answer = agent_pc.create_answer().await.unwrap();
+                                agent_pc.set_local_description(answer.clone()).unwrap();
+                                agent_pc.wait_for_gathering_complete().await;
+                                let answer = agent_pc.local_description().unwrap();
+                                let mut answer_sdp = answer.to_sdp_string();
+
+                                // Force sendrecv if needed (DCEP fix attempt)
+                                if answer_sdp.contains("a=sendonly") {
+                                    answer_sdp = answer_sdp.replace("a=sendonly", "a=sendrecv");
+                                }
+
+                                let response_json = serde_json::json!({
+                                    "uuid": uuid::Uuid::new_v4(),
+                                    "offer": offer_msg.offer,
+                                    "answer": answer_sdp
+                                });
+
+                                let response_body = response_json.to_string();
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                    response_body.len(),
+                                    response_body
+                                );
+                                socket.write_all(response.as_bytes()).await.unwrap();
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        // Setup Client
+        let client = CliClient::new(server_url, "test-token".to_string(), None);
+
+        // Run connect_port_forward in background
+        let client_clone = client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client_clone
+                .connect_port_forward("gpu03".to_string(), 4023)
+                .await
+            {
+                eprintln!("connect_port_forward failed: {}", e);
+            }
+        });
+
+        // Wait for listener to be ready
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Connect to the forwarded port
+        info!("Connecting to 127.0.0.1:4023");
+        let mut stream = TcpStream::connect("127.0.0.1:4023").await?;
+
+        info!("Waiting for Agent PC connection...");
+        agent_pc.wait_for_connection().await.unwrap();
+        info!("Agent PC connected!");
+
+        // Verify connection on Agent side
+        // Create negotiated DC on Agent side
+        let dc_config = DataChannelConfig {
+            ordered: true,
+            max_retransmits: Some(10),
+            negotiated: Some(0),
+            ..Default::default()
+        };
+        let dc = agent_pc.create_data_channel("port-forward", Some(dc_config)).unwrap();
+
+        // We need to drain events from agent_pc to make sure the connection progresses
+        let agent_pc_clone = agent_pc.clone();
+        tokio::spawn(async move {
+            while let Some(_) = agent_pc_clone.recv().await {
+                // Drain events
+            }
+        });
+
+        // Wait for DC open
+        let (open_tx, open_rx) = tokio::sync::oneshot::channel();
+        let dc_clone = dc.clone();
+        tokio::spawn(async move {
+            let mut open_tx = Some(open_tx);
+            while let Some(event) = dc_clone.recv().await {
+                if let DataChannelEvent::Open = event {
+                    if let Some(tx) = open_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+        });
+        
+        tokio::time::timeout(Duration::from_secs(5), open_rx).await??;
+        info!("DataChannel Open!");        Ok(())
     }
 }
