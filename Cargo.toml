@@ -18,4 +18,4 @@ tower-http = { version = "0.6.7", features = ["cors", "trace"] }
 portable-pty = "0.9.0"
 pty-process = { version = "0.5.3", features = ["async"] }
 bytes = "1.11.0"
-rustrtc = "0.2.0"
+rustrtc = "0.2.1"
