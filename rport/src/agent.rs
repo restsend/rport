@@ -218,7 +218,12 @@ impl Agent {
                             let client_ip = client_ip.clone();
                             let pc = pc_clone.clone();
                             let cancel_token = cancel_token.clone();
-
+                            tracing::info!(
+                                client_ip,
+                                "Data channel opened, starting TCP-WebRTC forwarding to {}:{}",
+                                target_host,
+                                target_port
+                            );
                             tokio::spawn(async move {
                                 tcp_webrtc_forwarding(
                                     cancel_token,

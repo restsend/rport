@@ -22,6 +22,7 @@ pub struct AgentConnection {
     pub token: String,
     pub last_ping: SystemTime,
     pub sender: mpsc::UnboundedSender<ServerMessage>,
+    pub connection_id: Uuid,
 }
 
 pub struct PendingOffer {
@@ -47,11 +48,13 @@ pub async fn connect_sse(
     info!(id, token, %client_ip, "agent connected");
 
     let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
+    let connection_id = Uuid::new_v4();
     let agent = AgentConnection {
         id: id.clone(),
         token: token.clone(),
         last_ping: SystemTime::now(),
         sender: sender.clone(),
+        connection_id,
     };
 
     // Store the agent connection
@@ -96,7 +99,12 @@ pub async fn connect_sse(
         }
         // Clean up when stream ends
         info!(id, "SSE stream ended for agent");
-        state_clone.agents.write().await.remove(&agent_key);
+        let mut agents = state_clone.agents.write().await;
+        if let Some(agent) = agents.get(&agent_key) {
+            if agent.connection_id == connection_id {
+                agents.remove(&agent_key);
+            }
+        }
     };
 
     let sse_response = Sse::new(stream.map_err(|e| {
