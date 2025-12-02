@@ -186,8 +186,6 @@ impl Agent {
         use rustrtc::transports::sctp::DataChannelConfig;
         let dc_config = DataChannelConfig {
             ordered: true,
-            max_retransmits: Some(10),
-            negotiated: Some(0),
             ..Default::default()
         };
         let data_channel = peer_connection.create_data_channel("port-forward", Some(dc_config))?;

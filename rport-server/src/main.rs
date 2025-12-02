@@ -24,7 +24,7 @@ pub fn get_first_non_loopback_interface() -> Result<IpAddr> {
 async fn main() -> anyhow::Result<()> {
     let cli = ServerCli::parse();
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new("rport=info,turn=warn,webrtc=warn"))
+        .with_env_filter(EnvFilter::from_default_env())
         .init();
 
     // Start TURN server
