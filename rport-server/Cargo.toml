@@ -26,4 +26,4 @@ uuid = { version = "1", features = ["v4", "serde"] }
 async-stream = "0.3.6"
 tower-http = { version = "0.6.7", features = ["cors", "trace"] }
 clap = { version = "4.5.53", features = ["derive"] }
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
