@@ -1,8 +1,8 @@
+use crate::{AnswerMessage, ServerMessage};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::Client;
-use rport_common::{AnswerMessage, ServerMessage, RECONNECT_INTERVAL};
 use rustrtc::{transports::sctp::DataChannelEvent, PeerConnection, SdpType, SessionDescription};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +14,8 @@ use uuid::Uuid;
 
 use crate::config::IceServerConfig;
 use crate::webrtc_config::WebRTCConfig;
+
+pub const RECONNECT_INTERVAL: u64 = 5; // seconds
 
 #[allow(dead_code)]
 struct ConnectionSession {

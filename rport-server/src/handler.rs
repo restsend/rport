@@ -1,3 +1,4 @@
+use crate::{AnswerMessage, OfferMessage, ServerMessage};
 use anyhow::anyhow;
 use axum::{
     extract::{Path, Query, State},
@@ -7,7 +8,6 @@ use axum::{
     Json, Router,
 };
 use futures::TryStreamExt;
-use rport_common::{AnswerMessage, OfferMessage, ServerMessage, PING_INTERVAL};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -16,6 +16,8 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+pub const PING_INTERVAL: u64 = 30; // seconds
 
 pub struct AgentConnection {
     pub id: String,

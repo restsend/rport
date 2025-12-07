@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -7,6 +8,23 @@ pub mod state;
 pub mod turn_server;
 pub use state::*;
 pub use turn_server::*;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferMessage {
+    pub id: String,
+    pub offer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnswerMessage {
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerMessage {
+    pub message_type: String,
+    pub data: serde_json::Value,
+}
 
 use crate::handler::{AgentConnection, PendingOffer};
 

@@ -36,17 +36,94 @@ It is built on top of [rustrtc](https://github.com/restsend/rustrtc), a pure Rus
 
 ## Quick Start
 
-### 1. Build the Project
+### 1. Install via crates.io
+```bash
+cargo install rport
+cargo install rport-server
+```
+
+### 2. Build from source
 
 ```bash
-# Clone the repository
+## Quick Start
+
+### 1. Build
+```bash
 git clone https://github.com/restsend/rport.git
 cd rport
+cargo build -r
+```
 
-# Build all components
-cargo build
-# Build with x86_64-unknown-linux-musl
-cargo build -r --target x86_64-unknown-linux-musl
+### 2. Run Server
+```bash
+# Start coordination server
+./target/release/rport-server --addr 0.0.0.0:3000
+```
+
+### 3. Run Agent (Remote)
+```bash
+# Start agent with ID "my-server" forwarding local SSH port 22
+./target/release/rport --target 22 --id my-server --token secret-token
+```
+
+### 4. Connect Client (Local)
+```bash
+# Map local port 8080 to remote agent's target
+./target/release/rport --port 8080 --id my-server --token secret-token
+
+# Connect via SSH
+ssh user@localhost -p 8080
+```
+
+## SSH Integration
+
+RPort is designed to work seamlessly with SSH using `ProxyCommand`.
+
+**Direct Usage:**
+```bash
+ssh -o ProxyCommand='rport --id my-server --token secret-token' user@localhost
+```
+
+**SSH Config (`~/.ssh/config`):**
+```ssh-config
+Host my-remote
+    ProxyCommand rport --id my-server --token secret-token
+    User ubuntu
+```
+
+## Configuration
+
+RPort looks for `~/.rport.toml`.
+
+```toml
+token = "secret-token"
+# Optional: Custom ICE servers (Built-in TURN is used by default)
+# [[ice_servers]]
+# urls = ["stun:stun.l.google.com:19302"]
+```
+
+## Advanced Usage
+
+**Daemon Mode:**
+```bash
+./rport --target 22 --id my-server --daemon --log-file /var/log/rport.log
+```
+
+**Web/Database Tunneling:**
+```bash
+# Remote: Share web server (port 80)
+./rport --target 80 --id web-server
+
+# Local: Access on port 8080
+./rport --port 8080 --id web-server
+```
+
+## Troubleshooting
+
+- **NAT Issues**: The built-in TURN server handles most cases. Ensure UDP traffic is allowed.
+- **Logs**: Use `RUST_LOG=rport=debug` for verbose output.
+
+## Security Considerations
 ```
 
 ### 2. Start the Server
@@ -54,6 +131,9 @@ cargo build -r --target x86_64-unknown-linux-musl
 ```bash
 # Start the coordination server
 ./target/release/rport-server --addr 0.0.0.0:3000
+
+# Start with custom TURN server address and public IP
+./target/release/rport-server --addr 0.0.0.0:3000 --turn-addr 0.0.0.0:3478 --public-ip 1.2.3.4
 ```
 
 ### 3. Configure and Run Agent
@@ -86,6 +166,17 @@ Start the agent on the remote machine:
 
 # Now you can SSH through the tunnel
 ssh user@localhost -p 8080
+```
+
+### 5. Use as SSH ProxyCommand
+
+You can use `rport` directly as an SSH ProxyCommand, which avoids opening a local port.
+
+```bash
+# Add to ~/.ssh/config
+Host my-remote-server
+    ProxyCommand rport --id my-server --token your-auth-token -- %h %p
+    User your-username
 ```
 
 ## Configuration

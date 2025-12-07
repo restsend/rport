@@ -11,7 +11,24 @@ use agent::Agent;
 use cli::Cli;
 use client::CliClient;
 use config::RportConfig;
+use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferMessage {
+    pub id: String,
+    pub offer: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AnswerMessage {
+    pub answer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ServerMessage {
+    pub message_type: String,
+    pub data: serde_json::Value,
+}
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();

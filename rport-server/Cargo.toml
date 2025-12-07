@@ -1,23 +1,13 @@
 [package]
 name = "rport-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
+description = "P2P Signaling server for rport"
+license = "MIT"
+repository = "https://github.com/restsend/rport"
+authors = ["jinti<shenjindi@fourz.cn"]
 
 [dependencies]
-axum = { workspace = true }
-tokio = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-uuid = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
-anyhow = { workspace = true }
-clap = { workspace = true }
-futures = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true }
-rport-common = { path = "../rport-common" }
-async-stream = "0.3"
 turn = "0.11.0"
 webrtc-util = "0.12.0"
 base64 = "0.22"
@@ -25,3 +15,15 @@ hmac = "0.12"
 sha1 = "0.10"
 rand = "0.9.2"
 get_if_addrs = "0.5.3"
+axum = "0.8.7"
+anyhow = "1.0.100"
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+async-stream = "0.3.6"
+tower-http = { version = "0.6.7", features = ["cors", "trace"] }
+clap = { version = "4.5.53", features = ["derive"] }
+tracing-subscriber = "0.3"

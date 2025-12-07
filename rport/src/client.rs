@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 use reqwest::Client;
-use rport_common::*;
 use rustrtc::{
     transports::sctp::{DataChannel, DataChannelConfig, DataChannelEvent},
     PeerConnection, PeerConnectionEvent, SdpType, SessionDescription,
@@ -12,8 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info};
 
-use crate::config::IceServerConfig;
 use crate::webrtc_config::WebRTCConfig;
+use crate::{config::IceServerConfig, OfferMessage};
 
 pub async fn forward_stream_to_webrtc<R, W>(
     peer_connection: Arc<PeerConnection>,
@@ -492,7 +491,7 @@ impl Clone for CliClient {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use rport_common::OfferMessage;
+    use crate::OfferMessage;
     use rustrtc::{PeerConnection, RtcConfiguration};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

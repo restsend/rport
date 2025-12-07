@@ -1,30 +1,33 @@
 [package]
 name = "rport"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
+description = "A p2p port forwarding client using WebRTC datachannels"
+license = "MIT"
+repository = "https://github.com/restsend/rport"
+authors = ["jinti<shenjindi@fourz.cn"]
 
 [dependencies]
-tokio = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-uuid = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
-anyhow = { workspace = true }
-clap = { workspace = true }
-futures = { workspace = true }
-rustrtc = { workspace = true }
-rport-common = { path = "../rport-common" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 reqwest = { version = "0.12.24", default-features = false, features = [
     "json",
     "stream",
     "rustls-tls",
 ] }
 tokio-tungstenite = "0.28.0"
-bytes = { workspace = true }
 tokio-util = { version = "0.7.16", features = ["codec"] }
 toml = "0.9.5"
 home = "0.5"
+bytes = "1.11.0"
+futures = "0.3"
+rustrtc = "0.2.6"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+clap = { version = "4.5.53", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5"
