@@ -201,13 +201,13 @@ impl CliClient {
             // Wait for connection to be established
             if let Err(_) = tokio::time::timeout(
                 Duration::from_secs(30),
-                peer_connection.wait_for_connection(),
+                peer_connection.wait_for_connected(),
             )
             .await
             {
                 return Err(anyhow!("WebRTC connection timeout"));
             }
-            peer_connection.wait_for_connection().await?;
+            peer_connection.wait_for_connected().await?;
 
             // Wait for data channel open and handle messages
             let (open_tx, open_rx) = tokio::sync::oneshot::channel();
@@ -345,7 +345,7 @@ impl CliClient {
             peer_connection.create_data_channel("port-forward", Some(data_channel_config))?;
 
         // Create offer
-        let offer = peer_connection.create_offer().await?;
+        let offer = peer_connection.create_offer()?;
         peer_connection.set_local_description(offer.clone())?;
 
         // Wait for ICE gathering
@@ -419,7 +419,7 @@ impl CliClient {
         };
         let data_channel =
             peer_connection.create_data_channel("port-forward", Some(data_channel_config))?;
-        let offer = peer_connection.create_offer().await?;
+        let offer = peer_connection.create_offer()?;
         peer_connection.set_local_description(offer.clone())?;
 
         if let Err(_) = tokio::time::timeout(
@@ -554,7 +554,7 @@ pub mod tests {
                                         .unwrap();
                                 agent_pc.set_remote_description(offer).await.unwrap();
 
-                                let answer = agent_pc.create_answer().await.unwrap();
+                                let answer = agent_pc.create_answer().unwrap();
                                 agent_pc.set_local_description(answer.clone()).unwrap();
                                 agent_pc.wait_for_gathering_complete().await;
                                 let answer = agent_pc.local_description().unwrap();
@@ -618,7 +618,7 @@ pub mod tests {
         });
 
         info!("Waiting for Agent PC connection...");
-        agent_pc.wait_for_connection().await.unwrap();
+        agent_pc.wait_for_connected().await.unwrap();
         info!("Agent PC connected!");
 
         let dc = tokio::time::timeout(Duration::from_secs(5), dc_rx).await??;
