@@ -41,6 +41,7 @@ pub struct RportConfig {
     pub ice_servers: Option<Vec<IceServerConfig>>,
     pub target: Option<String>,
     pub port: Option<u16>,
+    pub log_file: Option<String>,
 }
 
 impl Default for RportConfig {
@@ -52,6 +53,7 @@ impl Default for RportConfig {
             ice_servers: None,
             target: None,
             port: None,
+            log_file: None,
         }
     }
 }
@@ -89,6 +91,9 @@ impl RportConfig {
         }
         if let Some(port) = cli.port {
             self.port = Some(port);
+        }
+        if let Some(log_file) = cli.log_file {
+            self.log_file = Some(log_file.to_string_lossy().to_string());
         }
     }
 }

@@ -116,9 +116,22 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let client = CliClient::new(server, token, config.ice_servers.clone());
         client.connect_port_forward(agent_id, local_port).await?;
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::new("error"))
-            .init();
+        if let Some(log_file) = config.log_file.clone() {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_file)?;
+
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::from_default_env())
+                .with_writer(file)
+                .init();
+        } else {
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::from_default_env())
+                .with_writer(std::io::stderr)
+                .init();
+        }
         let agent_id = config.id.ok_or_else(|| {
             anyhow::anyhow!("Agent ID is required for port forwarding mode. Use --id <AGENT_ID>")
         })?;
