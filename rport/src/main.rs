@@ -136,7 +136,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             anyhow::anyhow!("Agent ID is required for port forwarding mode. Use --id <AGENT_ID>")
         })?;
         let client = CliClient::new(server, token, config.ice_servers.clone());
-        client.connect_proxy_command(agent_id).await?;
+        client
+            .connect_proxy_command(config.connect_timeout.clone(), agent_id)
+            .await?;
     }
 
     Ok(())

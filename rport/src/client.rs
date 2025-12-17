@@ -17,6 +17,7 @@ use crate::{config::IceServerConfig, OfferMessage};
 pub async fn forward_stream_to_webrtc<R, W>(
     peer_connection: Arc<PeerConnection>,
     data_channel: Arc<DataChannel>,
+    connect_timeout: Option<u32>,
     mut input: R,
     mut output: W,
 ) -> Result<()>
@@ -49,7 +50,9 @@ where
         }
     });
 
-    if let Err(_) = tokio::time::timeout(Duration::from_secs(10), open_rx).await {
+    let connect_timeout = connect_timeout.unwrap_or(30);
+    if let Err(_) = tokio::time::timeout(Duration::from_secs(connect_timeout.into()), open_rx).await
+    {
         return Err(anyhow!("Data channel open timeout"));
     }
     let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -58,7 +61,7 @@ where
     let dc_id = data_channel.id;
 
     let input_task = async move {
-        let mut buffer = [0u8; 1024];
+        let mut buffer = [0u8; 1200];
 
         loop {
             match input.read(&mut buffer).await {
@@ -130,13 +133,18 @@ impl CliClient {
         }
     }
 
-    pub async fn connect_proxy_command(&self, agent_id: String) -> Result<()> {
+    pub async fn connect_proxy_command(
+        &self,
+        connect_timeout: Option<u32>,
+        agent_id: String,
+    ) -> Result<()> {
         // ProxyCommand mode - NO LOGGING to avoid SSH interference
         let (peer_connection, data_channel) =
             self.create_webrtc_connection_silent(&agent_id).await?;
         if let Err(e) = forward_stream_to_webrtc(
             peer_connection,
             data_channel,
+            connect_timeout,
             tokio::io::stdin(),
             tokio::io::stdout(),
         )

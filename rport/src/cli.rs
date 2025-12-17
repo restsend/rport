@@ -32,4 +32,8 @@ pub struct Cli {
     /// ProxyCommand arguments: hostname and port (for SSH ProxyCommand usage)
     #[arg(value_name = "HOST")]
     pub proxy_args: Vec<String>,
+
+    /// Connection timeout in seconds
+    #[arg(long = "timeout")]
+    pub timeout: Option<u32>,
 }
