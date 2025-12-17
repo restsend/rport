@@ -74,6 +74,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         RportConfig::load_default()?
     };
 
+    let log_env = if cli.debug {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::from_default_env()
+    };
+
     // Merge CLI token with config
     config.merge_with_cli(cli);
 
@@ -87,10 +93,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     // Initialize tracing
     // In daemon mode, logs will be written to the log file
+
     if let Some(target) = config.target {
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env())
-            .init();
+        tracing_subscriber::fmt().with_env_filter(log_env).init();
         // Agent mode
         let (host, port) = parse_target(&target)?;
         let agent_id = config
@@ -106,9 +111,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         );
         agent.run().await?;
     } else if let Some(local_port) = config.port {
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env())
-            .init();
+        tracing_subscriber::fmt().with_env_filter(log_env).init();
         // CLI port forwarding mode
         let agent_id = config.id.ok_or_else(|| {
             anyhow::anyhow!("Agent ID is required for port forwarding mode. Use --id <AGENT_ID>")
@@ -123,12 +126,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 .open(log_file)?;
 
             tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::from_default_env())
+                .with_env_filter(log_env)
                 .with_writer(file)
                 .init();
         } else {
             tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::from_default_env())
+                .with_env_filter(log_env)
                 .with_writer(std::io::stderr)
                 .init();
         }

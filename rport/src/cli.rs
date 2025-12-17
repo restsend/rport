@@ -36,4 +36,7 @@ pub struct Cli {
     /// Connection timeout in seconds
     #[arg(long = "timeout")]
     pub timeout: Option<u32>,
+
+    #[arg(long = "debug", default_value_t = false)]
+    pub debug: bool,
 }
