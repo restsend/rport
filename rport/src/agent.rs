@@ -182,7 +182,7 @@ impl Agent {
             session_id
         );
 
-        let peer_connection = self.create_peer_connection().await?;
+        let peer_connection = self.webrtc_config.create_peer_connection().await?;
 
         // Create negotiated data channel
         use rustrtc::transports::sctp::DataChannelConfig;
@@ -218,7 +218,7 @@ impl Agent {
                             let client_ip = client_ip.clone();
                             let pc = pc_clone.clone();
                             let cancel_token = cancel_token.clone();
-                            tracing::info!(
+                            tracing::warn!(
                                 client_ip,
                                 "Data channel opened, starting TCP-WebRTC forwarding to {}:{}",
                                 target_host,
@@ -272,10 +272,6 @@ impl Agent {
             .to_sdp_string();
         Ok(answer_sdp)
     }
-
-    async fn create_peer_connection(&self) -> Result<Arc<PeerConnection>> {
-        self.webrtc_config.create_peer_connection().await
-    }
 }
 
 async fn tcp_webrtc_forwarding(
@@ -308,10 +304,12 @@ async fn tcp_webrtc_forwarding(
     );
 
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
+    let max_read_timeout = Duration::from_secs(1800); // 30 minutes
     let recv_from_tcp = async {
         let mut buffer = [0u8; 1024];
         loop {
-            match tcp_read.read(&mut buffer).await {
+            let r = tokio::time::timeout(max_read_timeout, tcp_read.read(&mut buffer)).await?;
+            match r {
                 Ok(0) => {
                     info!("TCP connection closed");
                     break;
@@ -326,6 +324,7 @@ async fn tcp_webrtc_forwarding(
                 Err(_) => break,
             }
         }
+        Ok::<(), anyhow::Error>(())
     };
     let recv_from_data_channel = async {
         while let Some(msg) = tcp_write_rx.recv().await {

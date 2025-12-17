@@ -183,17 +183,24 @@ impl CliClient {
         mut tcp_stream: TcpStream,
         agent_id: String,
     ) -> Result<()> {
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+        let max_read_timeout = Duration::from_secs(1800); // 30 minutes
         let setup_result = async {
             // Create WebRTC connection for this TCP connection
             let (peer_connection, data_channel) = self.create_webrtc_connection(&agent_id).await?;
 
-            // Spawn a task to keep the peer connection alive and process events
             let pc_clone = peer_connection.clone();
             tokio::spawn(async move {
                 while let Some(event) = pc_clone.recv().await {
-                    tracing::info!("CliClient PC Event received");
-                    if let PeerConnectionEvent::DataChannel(_) = event {
-                        tracing::info!("CliClient PC Event: DataChannel (unexpected)");
+                    match event {
+                        PeerConnectionEvent::DataChannel(dc) => {
+                            tracing::debug!(
+                                "CliClient PC Event: DataChannel: id={}, label={}",
+                                dc.id,
+                                dc.label
+                            );
+                        }
+                        _ => {}
                     }
                 }
             });
@@ -227,6 +234,7 @@ impl CliClient {
                             let _ = msg_tx.send(data);
                         }
                         DataChannelEvent::Close => {
+                            let _ = close_tx.send(());
                             break;
                         }
                     }
@@ -261,9 +269,9 @@ impl CliClient {
 
         let tcp_to_webrtc = async move {
             let mut buffer = [0u8; 1024];
-
             loop {
-                match tcp_read.read(&mut buffer).await {
+                let r = tokio::time::timeout(max_read_timeout, tcp_read.read(&mut buffer)).await?;
+                match r {
                     Ok(0) => {
                         info!("TCP connection closed by client");
                         break;
@@ -281,25 +289,12 @@ impl CliClient {
                     }
                 }
             }
+            Ok::<(), anyhow::Error>(())
         };
 
         // Set up WebRTC -> TCP forwarding
         let webrtc_to_tcp = async move {
-            let mut first_msg = true;
             while let Some(data) = msg_rx.recv().await {
-                if first_msg {
-                    if data.starts_with(b"RPORT_ERROR:") {
-                        let msg = String::from_utf8_lossy(&data);
-                        error!("Remote Agent Error: {}", msg);
-                        // Write to TCP so the user sees it too
-                        let _ = tcp_write.write_all(&data).await;
-                        let _ = tcp_write.flush().await;
-                        // Give the client some time to read the error before we close the socket
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        break;
-                    }
-                    first_msg = false;
-                }
                 if let Err(e) = tcp_write.write_all(&data).await {
                     error!("Failed to write to TCP: {}", e);
                     break;
@@ -309,11 +304,13 @@ impl CliClient {
                     break;
                 }
             }
-            info!("WebRTC data channel closed");
         };
 
         // Wait for either direction to close
         tokio::select! {
+            _ = close_rx => {
+                info!("Data channel closed");
+            }
             _ = tcp_to_webrtc => {
                 info!("TCP to WebRTC forwarding ended");
             }
@@ -323,7 +320,6 @@ impl CliClient {
         }
 
         peer_connection.close();
-
         Ok(())
     }
 
