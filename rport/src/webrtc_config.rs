@@ -1,7 +1,7 @@
 use anyhow::Result;
 use reqwest::Client;
 use rustrtc::{IceServer, PeerConnection, RtcConfiguration};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::config::IceServerConfig;
 
@@ -53,6 +53,8 @@ impl WebRTCConfig {
         let ice_servers = self.get_ice_servers().await;
         let config = RtcConfiguration {
             ice_servers,
+            sctp_max_association_retransmits: 20,
+            sctp_rto_max: Duration::from_secs(10),
             ..Default::default()
         };
         let peer_connection = Arc::new(PeerConnection::new(config));
