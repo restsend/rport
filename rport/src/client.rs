@@ -349,7 +349,7 @@ impl CliClient {
             peer_connection.create_data_channel("port-forward", Some(data_channel_config))?;
 
         // Create offer
-        let offer = peer_connection.create_offer()?;
+        let offer = peer_connection.create_offer().await?;
         peer_connection.set_local_description(offer.clone())?;
 
         // Wait for ICE gathering
@@ -423,7 +423,7 @@ impl CliClient {
         };
         let data_channel =
             peer_connection.create_data_channel("port-forward", Some(data_channel_config))?;
-        let offer = peer_connection.create_offer()?;
+        let offer = peer_connection.create_offer().await?;
         peer_connection.set_local_description(offer.clone())?;
 
         if let Err(_) = tokio::time::timeout(
@@ -558,7 +558,7 @@ pub mod tests {
                                         .unwrap();
                                 agent_pc.set_remote_description(offer).await.unwrap();
 
-                                let answer = agent_pc.create_answer().unwrap();
+                                let answer = agent_pc.create_answer().await.unwrap();
                                 agent_pc.set_local_description(answer.clone()).unwrap();
                                 agent_pc.wait_for_gathering_complete().await;
                                 let answer = agent_pc.local_description().unwrap();

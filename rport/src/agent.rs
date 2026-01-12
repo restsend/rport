@@ -260,7 +260,7 @@ impl Agent {
         });
 
         // Create answer
-        let answer = peer_connection.create_answer()?;
+        let answer = peer_connection.create_answer().await?;
         peer_connection.set_local_description(answer.clone())?;
 
         // Wait for ICE gathering to complete
