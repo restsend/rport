@@ -53,11 +53,11 @@ impl WebRTCConfig {
         let ice_servers = self.get_ice_servers().await;
         let config = RtcConfiguration {
             ice_servers,
-            sctp_rto_initial: Duration::from_millis(800),
-            sctp_rto_min: Duration::from_millis(400),
+            sctp_rto_initial: Duration::from_millis(400), // Reduced from 800ms for faster recovery
+            sctp_rto_min: Duration::from_millis(200),     // Reduced from 400ms
             sctp_rto_max: Duration::from_secs(30),
             sctp_max_association_retransmits: 15,
-            sctp_receive_window: 1024 * 1024,
+            sctp_receive_window: 2 * 1024 * 1024, // 2MB for better throughput
             ..Default::default()
         };
         let peer_connection = Arc::new(PeerConnection::new(config));
