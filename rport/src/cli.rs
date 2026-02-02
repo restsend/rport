@@ -4,6 +4,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "rport")]
 #[command(about = "Remote port forwarding client and agent")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 pub struct Cli {
     /// Configuration file path
     #[arg(short = 'f', long = "conf")]
