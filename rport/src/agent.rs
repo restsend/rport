@@ -243,12 +243,16 @@ impl Agent {
                         let _ = tcp_write_tx.send(Bytes::from(data));
                     }
                     DataChannelEvent::Close => {
-                        info!("Data channel closed, cancelling forwarding");
+                        info!("Data channel closed, cancelling forwarding and closing peer connection");
                         cancel_token.cancel();
+                        // Close the peer connection to release resources
+                        pc_clone.close();
                         break;
                     }
                 }
             }
+            info!("DataChannel event loop ended, ensuring peer connection is closed");
+            pc_clone.close();
         });
 
         // Drain PeerConnection events
@@ -287,11 +291,13 @@ async fn tcp_webrtc_forwarding(
         Ok(stream) => stream,
         Err(e) => {
             error!(
-                "Failed to connect to {}: {}: {}",
+                "Failed to connect to {}:{}: {}",
                 target_host, target_port, e
             );
+            // Close peer connection on connection failure
+            let _ = peer_connection.close();
             return Err(anyhow!(
-                "Failed to connect to {}: {}",
+                "Failed to connect to {}:{}",
                 target_host,
                 target_port
             ));
@@ -328,8 +334,13 @@ async fn tcp_webrtc_forwarding(
     };
     let recv_from_data_channel = async {
         while let Some(msg) = tcp_write_rx.recv().await {
-            if tcp_write.write_all(&msg).await.is_err() {
-                error!("Failed to write to TCP stream");
+            if let Err(e) = tcp_write.write_all(&msg).await {
+                error!("Failed to write to TCP stream: {}", e);
+                break;
+            }
+            // Flush to ensure data is sent immediately
+            if let Err(e) = tcp_write.flush().await {
+                error!("Failed to flush TCP stream: {}", e);
                 break;
             }
         }
@@ -346,5 +357,13 @@ async fn tcp_webrtc_forwarding(
             info!(client_ip, "TCP stream closed");
         }
     }
+
+    // Clean up resources explicitly
+    info!(client_ip, "Cleaning up TCP connection and peer connection");
+    let _ = tcp_write.shutdown().await;
+    drop(tcp_write);
+    drop(tcp_read);
+
+    // Note: PeerConnection will be closed by the DataChannel event handler
     Ok(())
 }
