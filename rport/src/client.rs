@@ -14,6 +14,9 @@ use tracing::{error, info};
 use crate::webrtc_config::WebRTCConfig;
 use crate::{config::IceServerConfig, OfferMessage};
 
+const DC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub async fn forward_stream_to_webrtc<R, W>(
     peer_connection: Arc<PeerConnection>,
     data_channel: Arc<DataChannel>,
@@ -26,11 +29,13 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     // Wait for data channel open
-    // We need to spawn a task to consume events from data channel to detect Open
     let (open_tx, open_rx) = tokio::sync::oneshot::channel();
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    let dc_closed = tokio_util::sync::CancellationToken::new();
 
     let dc_clone = data_channel.clone();
+    let pc_disc = peer_connection.clone();
+    let dc_closed_tx = dc_closed.clone();
     tokio::spawn(async move {
         let mut open_tx = Some(open_tx);
         while let Some(event) = dc_clone.recv().await {
@@ -44,6 +49,10 @@ where
                     let _ = msg_tx.send(data);
                 }
                 DataChannelEvent::Close => {
+                    if let Some(reason) = pc_disc.disconnect_reason() {
+                        tracing::warn!("Data channel closed (reason: {})", reason);
+                    }
+                    dc_closed_tx.cancel();
                     break;
                 }
             }
@@ -55,7 +64,31 @@ where
     {
         return Err(anyhow!("Data channel open timeout"));
     }
-    let cancel_token = tokio_util::sync::CancellationToken::new();
+
+    let pc_monitor = peer_connection.clone();
+    let webrtc_dead = tokio_util::sync::CancellationToken::new();
+    let webrtc_dead_tx = webrtc_dead.clone();
+    tokio::spawn(async move {
+        let mut state_rx = pc_monitor.subscribe_peer_state();
+        while let Ok(()) = state_rx.changed().await {
+            let state = *state_rx.borrow();
+            match state {
+                rustrtc::PeerConnectionState::Disconnected
+                | rustrtc::PeerConnectionState::Failed
+                | rustrtc::PeerConnectionState::Closed => {
+                    if let Some(reason) = pc_monitor.disconnect_reason() {
+                        tracing::warn!("WebRTC connection lost: {} (state: {:?})", reason, state);
+                    } else {
+                        tracing::warn!("WebRTC connection lost: state {:?}", state);
+                    }
+                    webrtc_dead_tx.cancel();
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
     // Set up input -> WebRTC forwarding
     let pc_clone = peer_connection.clone();
     let dc_id = data_channel.id;
@@ -66,19 +99,17 @@ where
         loop {
             match input.read(&mut buffer).await {
                 Ok(0) => {
-                    // input closed - exit silently
+                    tracing::debug!("forward_stream_to_webrtc: input EOF");
                     break;
                 }
                 Ok(n) => {
                     let data = &buffer[..n];
                     if let Err(e) = pc_clone.send_data(dc_id, data).await {
-                        // WebRTC send failed - exit silently
                         tracing::error!("Failed to send data through WebRTC: {}", e);
                         break;
                     }
                 }
                 Err(e) => {
-                    // input read failed - exit silently
                     tracing::debug!("forward_stream_to_webrtc: input read failed: {}", e);
                     break;
                 }
@@ -87,7 +118,7 @@ where
     };
 
     // Set up WebRTC -> output forwarding
-    let output_task = tokio::spawn(async move {
+    let mut output_task = tokio::spawn(async move {
         while let Some(data) = msg_rx.recv().await {
             if output.write_all(&data).await.is_err() {
                 break;
@@ -98,12 +129,58 @@ where
         }
     });
 
+    let pc_keepalive = peer_connection.clone();
+    let dc_id_keepalive = data_channel.id;
+    let dc_closed_keepalive = dc_closed.clone();
+    let keepalive_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DC_KEEPALIVE_INTERVAL);
+        interval.tick().await; // skip first immediate tick
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Send a zero-length data channel message as keepalive
+                    if let Err(_) = pc_keepalive.send_data(dc_id_keepalive, &[]).await {
+                        break;
+                    }
+                }
+                _ = dc_closed_keepalive.cancelled() => break,
+            }
+        }
+    });
+
+    // Main select: wait for any side to finish
     tokio::select! {
-        _ = cancel_token.cancelled() => {}
-        _ = input_task => {}
-        _ = output_task => {}
+        _ = webrtc_dead.cancelled() => {
+            // WebRTC connection died — exit immediately
+            tracing::debug!("forward_stream_to_webrtc: exiting due to WebRTC disconnect");
+        }
+        _ = dc_closed.cancelled() => {
+            // Data channel closed from remote side
+            tracing::debug!("forward_stream_to_webrtc: data channel closed by remote");
+        }
+        _ = input_task => {
+            // Local input (stdin/TCP) closed.
+            // Don't exit immediately — wait for output side to drain or WebRTC to close,
+            // so SCTP has time to flush any pending data.
+            tracing::debug!("forward_stream_to_webrtc: input closed, waiting for drain");
+            tokio::select! {
+                _ = tokio::time::sleep(DRAIN_TIMEOUT) => {
+                    tracing::debug!("forward_stream_to_webrtc: drain timeout, closing");
+                }
+                _ = dc_closed.cancelled() => {
+                    tracing::debug!("forward_stream_to_webrtc: data channel closed during drain");
+                }
+                _ = &mut output_task => {
+                    tracing::debug!("forward_stream_to_webrtc: output finished during drain");
+                }
+            }
+        }
+        _ = &mut output_task => {
+            tracing::debug!("forward_stream_to_webrtc: output closed");
+        }
     }
 
+    keepalive_task.abort();
     Ok(())
 }
 
@@ -213,6 +290,34 @@ impl CliClient {
                 }
             });
 
+            // Monitor peer connection state for disconnect reasons
+            let pc_monitor = peer_connection.clone();
+            tokio::spawn(async move {
+                let mut state_rx = pc_monitor.subscribe_peer_state();
+                while let Ok(()) = state_rx.changed().await {
+                    let state = *state_rx.borrow();
+                    match state {
+                        rustrtc::PeerConnectionState::Disconnected
+                        | rustrtc::PeerConnectionState::Failed
+                        | rustrtc::PeerConnectionState::Closed => {
+                            if let Some(reason) = pc_monitor.disconnect_reason() {
+                                tracing::warn!(
+                                    "WebRTC connection ended: {} (state: {:?})",
+                                    reason,
+                                    state
+                                );
+                            } else {
+                                tracing::warn!("WebRTC connection ended: state {:?}", state);
+                            }
+                            break;
+                        }
+                        _ => {
+                            tracing::debug!("Peer connection state: {:?}", state);
+                        }
+                    }
+                }
+            });
+
             // Wait for connection to be established
             if let Err(_) = tokio::time::timeout(
                 Duration::from_secs(30),
@@ -317,7 +422,11 @@ impl CliClient {
         // Wait for either direction to close
         tokio::select! {
             _ = close_rx => {
-                info!("Data channel closed");
+                let reason_str = peer_connection
+                    .disconnect_reason()
+                    .map(|r| format!("{}", r))
+                    .unwrap_or_else(|| "normal close".to_string());
+                info!("Data channel closed (reason: {})", reason_str);
             }
             _ = tcp_to_webrtc => {
                 info!("TCP to WebRTC forwarding ended");
