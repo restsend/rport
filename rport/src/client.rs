@@ -14,7 +14,6 @@ use tracing::{error, info};
 use crate::webrtc_config::WebRTCConfig;
 use crate::{config::IceServerConfig, OfferMessage};
 
-const DC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn forward_stream_to_webrtc<R, W>(
@@ -129,25 +128,6 @@ where
         }
     });
 
-    let pc_keepalive = peer_connection.clone();
-    let dc_id_keepalive = data_channel.id;
-    let dc_closed_keepalive = dc_closed.clone();
-    let keepalive_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(DC_KEEPALIVE_INTERVAL);
-        interval.tick().await; // skip first immediate tick
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    // Send a zero-length data channel message as keepalive
-                    if let Err(_) = pc_keepalive.send_data(dc_id_keepalive, &[]).await {
-                        break;
-                    }
-                }
-                _ = dc_closed_keepalive.cancelled() => break,
-            }
-        }
-    });
-
     // Main select: wait for any side to finish
     tokio::select! {
         _ = webrtc_dead.cancelled() => {
@@ -179,8 +159,6 @@ where
             tracing::debug!("forward_stream_to_webrtc: output closed");
         }
     }
-
-    keepalive_task.abort();
     Ok(())
 }
 
