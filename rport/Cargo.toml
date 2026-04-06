@@ -1,6 +1,6 @@
 [package]
 name = "rport"
-version = "0.2.23"
+version = "0.2.24"
 edition = "2021"
 description = "A p2p port forwarding client using WebRTC datachannels"
 license = "MIT"
@@ -24,7 +24,7 @@ home = "0.5"
 bytes = "1.11.0"
 futures = "0.3"
 #rustrtc = { path = "../../rustrtc" }
-rustrtc = "0.3.41"
+rustrtc = "0.3.42"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
