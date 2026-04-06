@@ -58,6 +58,7 @@ impl WebRTCConfig {
             sctp_rto_max: Duration::from_secs(30),
             sctp_max_association_retransmits: 15,
             sctp_receive_window: 2 * 1024 * 1024, // 2MB for better throughput
+	    enable_upnp: true,
             ..Default::default()
         };
         let peer_connection = Arc::new(PeerConnection::new(config));
