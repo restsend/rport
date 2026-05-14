@@ -174,11 +174,13 @@ impl CliClient {
         server_url: String,
         token: String,
         ice_servers: Option<Vec<IceServerConfig>>,
+        enable_upnp: bool,
     ) -> Self {
         let webrtc_config = WebRTCConfig::new(
             server_url.clone(),
             token.clone(),
             ice_servers.unwrap_or_default(),
+            enable_upnp,
         );
         Self {
             server_url,
@@ -672,7 +674,7 @@ pub mod tests {
         });
 
         // Setup Client
-        let client = CliClient::new(server_url, "test-token".to_string(), None);
+        let client = CliClient::new(server_url, "test-token".to_string(), None, false);
 
         // Run connect_port_forward in background
         let client_clone = client.clone();

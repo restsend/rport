@@ -108,6 +108,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             host,
             port,
             config.ice_servers.clone(),
+            config.upnp.unwrap_or(false),
         );
         agent.run().await?;
     } else if let Some(local_port) = config.port {
@@ -116,7 +117,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let agent_id = config.id.ok_or_else(|| {
             anyhow::anyhow!("Agent ID is required for port forwarding mode. Use --id <AGENT_ID>")
         })?;
-        let client = CliClient::new(server, token, config.ice_servers.clone());
+        let client = CliClient::new(
+            server,
+            token,
+            config.ice_servers.clone(),
+            config.upnp.unwrap_or(false),
+        );
         client.connect_port_forward(agent_id, local_port).await?;
     } else {
         if let Some(log_file) = config.log_file.clone() {
@@ -138,7 +144,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let agent_id = config.id.ok_or_else(|| {
             anyhow::anyhow!("Agent ID is required for port forwarding mode. Use --id <AGENT_ID>")
         })?;
-        let client = CliClient::new(server, token, config.ice_servers.clone());
+        let client = CliClient::new(
+            server,
+            token,
+            config.ice_servers.clone(),
+            config.upnp.unwrap_or(false),
+        );
         client
             .connect_proxy_command(config.connect_timeout.clone(), agent_id)
             .await?;

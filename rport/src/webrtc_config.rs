@@ -10,14 +10,21 @@ pub struct WebRTCConfig {
     pub server: String,
     pub token: String,
     pub ice_servers: Vec<IceServerConfig>,
+    pub enable_upnp: bool,
 }
 
 impl WebRTCConfig {
-    pub fn new(server: String, token: String, ice_servers: Vec<IceServerConfig>) -> Self {
+    pub fn new(
+        server: String,
+        token: String,
+        ice_servers: Vec<IceServerConfig>,
+        enable_upnp: bool,
+    ) -> Self {
         Self {
             server,
             token,
             ice_servers,
+            enable_upnp,
         }
     }
 
@@ -58,7 +65,7 @@ impl WebRTCConfig {
             sctp_rto_max: Duration::from_secs(30),
             sctp_max_association_retransmits: 15,
             sctp_receive_window: 2 * 1024 * 1024, // 2MB for better throughput
-	    enable_upnp: true,
+            enable_upnp: self.enable_upnp,
             ..Default::default()
         };
         let peer_connection = Arc::new(PeerConnection::new(config));

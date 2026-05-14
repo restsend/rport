@@ -42,11 +42,13 @@ impl Agent {
         target_host: String,
         target_port: u16,
         ice_servers: Option<Vec<IceServerConfig>>,
+        enable_upnp: bool,
     ) -> Self {
         let webrtc_config = WebRTCConfig::new(
             server_url.clone(),
             token.clone(),
             ice_servers.unwrap_or_default(),
+            enable_upnp,
         );
         Self {
             server_url,

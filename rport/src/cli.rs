@@ -40,4 +40,7 @@ pub struct Cli {
 
     #[arg(long = "debug", default_value_t = false)]
     pub debug: bool,
+
+    #[arg(long = "upnp", default_value_t = false)]
+    pub upnp: bool,
 }

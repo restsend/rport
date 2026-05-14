@@ -43,6 +43,7 @@ pub struct RportConfig {
     pub port: Option<u16>,
     pub log_file: Option<String>,
     pub connect_timeout: Option<u32>,
+    pub upnp: Option<bool>,
 }
 
 impl Default for RportConfig {
@@ -56,6 +57,7 @@ impl Default for RportConfig {
             port: None,
             log_file: None,
             connect_timeout: Some(30),
+            upnp: Some(true),
         }
     }
 }
@@ -100,5 +102,6 @@ impl RportConfig {
         if let Some(connect_timeout) = cli.timeout {
             self.connect_timeout = Some(connect_timeout);
         }
+        self.upnp = Some(cli.upnp);
     }
 }
