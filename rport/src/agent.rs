@@ -16,6 +16,7 @@ use crate::config::IceServerConfig;
 use crate::webrtc_config::WebRTCConfig;
 
 pub const RECONNECT_INTERVAL: u64 = 5; // seconds
+const IDLE_TIMEOUT: Duration = Duration::from_secs(180); // 3 minutes
 
 #[allow(dead_code)]
 struct ConnectionSession {
@@ -208,115 +209,125 @@ impl Agent {
 
         // Handle DataChannel events
         let session_id_str = session_id.to_string();
+        let setup_cancel = tokio_util::sync::CancellationToken::new();
+        let task_cancel = setup_cancel.clone();
         tokio::spawn(async move {
-            let cancel_token = tokio_util::sync::CancellationToken::new();
-            let (tcp_write_tx, tcp_write_rx) = mpsc::unbounded_channel();
-            let mut tcp_write_rx = Some(tcp_write_rx);
-            let session_start = tokio::time::Instant::now();
-            let mut dc_msg_count: u64 = 0;
-            let mut dc_bytes_recv: u64 = 0;
-            let mut dc_keepalive_count: u64 = 0;
+            tokio::select! {
+                _ = task_cancel.cancelled() => {
+                    debug!(session = session_id_str, "Setup failed, cleaning up peer connection");
+                    pc_clone.close();
+                }
+                _ = async {
+                    let cancel_token = tokio_util::sync::CancellationToken::new();
+                    let (tcp_write_tx, tcp_write_rx) = mpsc::unbounded_channel();
+                    let mut tcp_write_rx = Some(tcp_write_rx);
+                    let session_start = tokio::time::Instant::now();
+                    let mut dc_msg_count: u64 = 0;
+                    let mut dc_bytes_recv: u64 = 0;
+                    let mut dc_keepalive_count: u64 = 0;
 
-            // Monitor peer connection state for disconnect reasons
-            let pc_monitor = pc_clone.clone();
-            let sid = session_id_str.clone();
-            tokio::spawn(async move {
-                let mut state_rx = pc_monitor.subscribe_peer_state();
-                while let Ok(()) = state_rx.changed().await {
-                    let state = *state_rx.borrow();
-                    match state {
-                        rustrtc::PeerConnectionState::Connected => {
-                            info!(session = sid, "WebRTC connected");
-                        }
-                        rustrtc::PeerConnectionState::Disconnected
-                        | rustrtc::PeerConnectionState::Failed
-                        | rustrtc::PeerConnectionState::Closed => {
-                            if let Some(reason) = pc_monitor.disconnect_reason() {
-                                warn!(
-                                    session = sid,
-                                    "WebRTC connection ended: {} (state: {:?})", reason, state
-                                );
-                            } else {
-                                warn!(session = sid, "WebRTC connection ended: state {:?}", state);
+                    // Monitor peer connection state for disconnect reasons
+                    let pc_monitor = pc_clone.clone();
+                    let sid = session_id_str.clone();
+                    tokio::spawn(async move {
+                        let mut state_rx = pc_monitor.subscribe_peer_state();
+                        while let Ok(()) = state_rx.changed().await {
+                            let state = *state_rx.borrow();
+                            match state {
+                                rustrtc::PeerConnectionState::Connected => {
+                                    info!(session = sid, "WebRTC connected");
+                                }
+                                rustrtc::PeerConnectionState::Disconnected
+                                | rustrtc::PeerConnectionState::Failed
+                                | rustrtc::PeerConnectionState::Closed => {
+                                    if let Some(reason) = pc_monitor.disconnect_reason() {
+                                        warn!(
+                                            session = sid,
+                                            "WebRTC connection ended: {} (state: {:?})", reason, state
+                                        );
+                                    } else {
+                                        warn!(session = sid, "WebRTC connection ended: state {:?}", state);
+                                    }
+                                    break;
+                                }
+                                _ => {
+                                    debug!(session = sid, "Peer connection state: {:?}", state);
+                                }
                             }
-                            break;
                         }
-                        _ => {
-                            debug!(session = sid, "Peer connection state: {:?}", state);
-                        }
-                    }
-                }
-            });
+                    });
 
-            while let Some(dc_event) = dc_clone.recv().await {
-                match dc_event {
-                    DataChannelEvent::Open => {
-                        if let Some(rx) = tcp_write_rx.take() {
-                            let target_host = target_host.clone();
-                            let client_ip = client_ip.clone();
-                            let pc = pc_clone.clone();
-                            let cancel_token = cancel_token.clone();
-                            let sid = session_id_str.clone();
-                            info!(
-                                session = session_id_str,
-                                client_ip,
-                                "Data channel opened, starting TCP-WebRTC forwarding to {}:{}",
-                                target_host,
-                                target_port
-                            );
-                            tokio::spawn(async move {
-                                tcp_webrtc_forwarding(
-                                    cancel_token,
-                                    rx,
-                                    sid,
-                                    client_ip,
-                                    pc,
-                                    dc_id,
-                                    &target_host,
-                                    target_port,
-                                )
-                                .await
-                                .ok();
-                            });
+                    while let Some(dc_event) = dc_clone.recv().await {
+                        match dc_event {
+                            DataChannelEvent::Open => {
+                                if let Some(rx) = tcp_write_rx.take() {
+                                    let target_host = target_host.clone();
+                                    let client_ip = client_ip.clone();
+                                    let pc = pc_clone.clone();
+                                    let cancel_token = cancel_token.clone();
+                                    let sid = session_id_str.clone();
+                                    info!(
+                                        session = session_id_str,
+                                        client_ip,
+                                        "Data channel opened, starting TCP-WebRTC forwarding to {}:{}",
+                                        target_host,
+                                        target_port
+                                    );
+                                    tokio::spawn(async move {
+                                        tcp_webrtc_forwarding(
+                                            cancel_token,
+                                            rx,
+                                            sid,
+                                            client_ip,
+                                            pc,
+                                            dc_id,
+                                            &target_host,
+                                            target_port,
+                                        )
+                                        .await
+                                        .ok();
+                                    });
+                                }
+                            }
+                            DataChannelEvent::Message(data) => {
+                                if data.is_empty() {
+                                    dc_keepalive_count += 1;
+                                } else {
+                                    dc_msg_count += 1;
+                                    dc_bytes_recv += data.len() as u64;
+                                }
+                                let _ = tcp_write_tx.send(Bytes::from(data));
+                            }
+                            DataChannelEvent::Close => {
+                                let elapsed = session_start.elapsed();
+                                let reason_str = pc_clone
+                                    .disconnect_reason()
+                                    .map(|r| format!("{}", r))
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                info!(
+                                    session = session_id_str,
+                                    "Data channel closed: reason={}, duration={:.1}s, msgs={}, bytes_recv={}, keepalives={}",
+                                    reason_str,
+                                    elapsed.as_secs_f64(),
+                                    dc_msg_count,
+                                    dc_bytes_recv,
+                                    dc_keepalive_count
+                                );
+                                cancel_token.cancel();
+                                pc_clone.close();
+                                break;
+                            }
                         }
                     }
-                    DataChannelEvent::Message(data) => {
-                        if data.is_empty() {
-                            dc_keepalive_count += 1;
-                        } else {
-                            dc_msg_count += 1;
-                            dc_bytes_recv += data.len() as u64;
-                        }
-                        let _ = tcp_write_tx.send(Bytes::from(data));
-                    }
-                    DataChannelEvent::Close => {
-                        let elapsed = session_start.elapsed();
-                        let reason_str = pc_clone
-                            .disconnect_reason()
-                            .map(|r| format!("{}", r))
-                            .unwrap_or_else(|| "unknown".to_string());
-                        info!(
-                            session = session_id_str,
-                            "Data channel closed: reason={}, duration={:.1}s, msgs={}, bytes_recv={}, keepalives={}",
-                            reason_str,
-                            elapsed.as_secs_f64(),
-                            dc_msg_count,
-                            dc_bytes_recv,
-                            dc_keepalive_count
-                        );
-                        cancel_token.cancel();
-                        pc_clone.close();
-                        break;
-                    }
-                }
+                    let elapsed = session_start.elapsed();
+                    info!(
+                        session = session_id_str,
+                        "DataChannel event loop ended after {:.1}s, ensuring peer connection is closed",
+                        elapsed.as_secs_f64()
+                    );
+                    pc_clone.close();
+                } => {}
             }
-            let elapsed = session_start.elapsed();
-            info!(
-                session = session_id_str,
-                "DataChannel event loop ended after {:.1}s, ensuring peer connection is closed",
-                elapsed.as_secs_f64()
-            );
-            pc_clone.close();
         });
 
         // Drain PeerConnection events
@@ -328,16 +339,28 @@ impl Agent {
         });
 
         // Create answer
-        let answer = peer_connection.create_answer().await?;
-        peer_connection.set_local_description(answer.clone())?;
+        let answer = match peer_connection.create_answer().await {
+            Ok(a) => a,
+            Err(e) => {
+                setup_cancel.cancel();
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = peer_connection.set_local_description(answer.clone()) {
+            setup_cancel.cancel();
+            return Err(e.into());
+        }
 
         // Wait for ICE gathering to complete
         peer_connection.wait_for_gathering_complete().await;
 
-        let answer_sdp = peer_connection
-            .local_description()
-            .ok_or_else(|| anyhow!("Failed to get local description"))?
-            .to_sdp_string();
+        let answer_sdp = match peer_connection.local_description() {
+            Some(d) => d.to_sdp_string(),
+            None => {
+                setup_cancel.cancel();
+                return Err(anyhow!("Failed to get local description"));
+            }
+        };
         Ok(answer_sdp)
     }
 }
@@ -379,19 +402,23 @@ async fn tcp_webrtc_forwarding(
     let dc_to_tcp_keepalives = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
-    let max_read_timeout = Duration::from_secs(1800); // 30 minutes
+
+    let last_activity = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
+    let idle_timeout = IDLE_TIMEOUT;
 
     let tcp_to_dc_counter = tcp_to_dc_bytes.clone();
+    let la_tcp = last_activity.clone();
     let recv_from_tcp = async {
         let mut buffer = [0u8; 1024];
         loop {
-            let r = tokio::time::timeout(max_read_timeout, tcp_read.read(&mut buffer)).await;
+            let r = tcp_read.read(&mut buffer).await;
             match r {
-                Ok(Ok(0)) => {
+                Ok(0) => {
                     debug!(session = session_id, "TCP connection closed (EOF)");
                     break;
                 }
-                Ok(Ok(n)) => {
+                Ok(n) => {
+                    *la_tcp.lock().unwrap() = tokio::time::Instant::now();
                     tcp_to_dc_counter.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                     let data = &buffer[..n];
                     if let Err(e) = peer_connection.send_data(channel_id, data).await {
@@ -402,16 +429,8 @@ async fn tcp_webrtc_forwarding(
                         break;
                     }
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     error!(session = session_id, "TCP read error: {}", e);
-                    break;
-                }
-                Err(_) => {
-                    warn!(
-                        session = session_id,
-                        "TCP read timeout ({}s), closing",
-                        max_read_timeout.as_secs()
-                    );
                     break;
                 }
             }
@@ -420,9 +439,11 @@ async fn tcp_webrtc_forwarding(
 
     let dc_to_tcp_counter = dc_to_tcp_bytes.clone();
     let dc_keepalive_counter = dc_to_tcp_keepalives.clone();
+    let la_dc = last_activity.clone();
     let sid2 = session_id.clone();
     let recv_from_data_channel = async move {
         while let Some(msg) = tcp_write_rx.recv().await {
+            *la_dc.lock().unwrap() = tokio::time::Instant::now();
             // Ignore zero-length messages (keepalive pings from client)
             if msg.is_empty() {
                 dc_keepalive_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -442,6 +463,17 @@ async fn tcp_webrtc_forwarding(
         let _ = tcp_write.shutdown().await;
     };
 
+    let la_idle = last_activity.clone();
+    let idle_timeout_fut = async move {
+        loop {
+            let elapsed = la_idle.lock().unwrap().elapsed();
+            if elapsed >= idle_timeout {
+                break;
+            }
+            tokio::time::sleep(idle_timeout - elapsed).await;
+        }
+    };
+
     let exit_reason;
     tokio::select! {
         _ = cancel_token.cancelled() => {
@@ -452,6 +484,9 @@ async fn tcp_webrtc_forwarding(
         }
         _ = recv_from_tcp => {
             exit_reason = "tcp_closed";
+        }
+        _ = idle_timeout_fut => {
+            exit_reason = "idle_timeout";
         }
     }
 
