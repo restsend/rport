@@ -250,99 +250,9 @@ impl CliClient {
     ) -> Result<()> {
         let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         let max_read_timeout = Duration::from_secs(1800); // 30 minutes
-        let setup_result = async {
-            // Create WebRTC connection for this TCP connection
-            let (peer_connection, data_channel) = self.create_webrtc_connection(&agent_id).await?;
 
-            let pc_clone = peer_connection.clone();
-            tokio::spawn(async move {
-                while let Some(event) = pc_clone.recv().await {
-                    match event {
-                        PeerConnectionEvent::DataChannel(dc) => {
-                            tracing::debug!(
-                                "CliClient PC Event: DataChannel: id={}, label={}",
-                                dc.id,
-                                dc.label
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-            });
-
-            // Monitor peer connection state for disconnect reasons
-            let pc_monitor = peer_connection.clone();
-            tokio::spawn(async move {
-                let mut state_rx = pc_monitor.subscribe_peer_state();
-                while let Ok(()) = state_rx.changed().await {
-                    let state = *state_rx.borrow();
-                    match state {
-                        rustrtc::PeerConnectionState::Disconnected
-                        | rustrtc::PeerConnectionState::Failed
-                        | rustrtc::PeerConnectionState::Closed => {
-                            if let Some(reason) = pc_monitor.disconnect_reason() {
-                                tracing::warn!(
-                                    "WebRTC connection ended: {} (state: {:?})",
-                                    reason,
-                                    state
-                                );
-                            } else {
-                                tracing::warn!("WebRTC connection ended: state {:?}", state);
-                            }
-                            break;
-                        }
-                        _ => {
-                            tracing::debug!("Peer connection state: {:?}", state);
-                        }
-                    }
-                }
-            });
-
-            // Wait for connection to be established
-            if let Err(_) = tokio::time::timeout(
-                Duration::from_secs(30),
-                peer_connection.wait_for_connected(),
-            )
-            .await
-            {
-                return Err(anyhow!("WebRTC connection timeout"));
-            }
-            peer_connection.wait_for_connected().await?;
-
-            // Wait for data channel open and handle messages
-            let (open_tx, open_rx) = tokio::sync::oneshot::channel();
-            let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel();
-
-            let dc_clone = data_channel.clone();
-            tokio::spawn(async move {
-                let mut open_tx = Some(open_tx);
-                while let Some(event) = dc_clone.recv().await {
-                    match event {
-                        DataChannelEvent::Open => {
-                            if let Some(tx) = open_tx.take() {
-                                let _ = tx.send(());
-                            }
-                        }
-                        DataChannelEvent::Message(data) => {
-                            let _ = msg_tx.send(data);
-                        }
-                        DataChannelEvent::Close => {
-                            let _ = close_tx.send(());
-                            break;
-                        }
-                    }
-                }
-            });
-
-            if let Err(_) = tokio::time::timeout(Duration::from_secs(10), open_rx).await {
-                return Err(anyhow!("Data channel open timeout"));
-            }
-
-            Ok((peer_connection, data_channel, msg_rx))
-        }
-        .await;
-
-        let (peer_connection, data_channel, mut msg_rx) = match setup_result {
+        // Create WebRTC connection for this TCP connection
+        let (peer_connection, data_channel) = match self.create_webrtc_connection(&agent_id).await {
             Ok(res) => res,
             Err(e) => {
                 let msg = format!("RPORT_SETUP_ERROR: {}\n", e);
@@ -353,6 +263,100 @@ impl CliClient {
                 return Err(e);
             }
         };
+
+        let pc_clone = peer_connection.clone();
+        tokio::spawn(async move {
+            while let Some(event) = pc_clone.recv().await {
+                match event {
+                    PeerConnectionEvent::DataChannel(dc) => {
+                        tracing::debug!(
+                            "CliClient PC Event: DataChannel: id={}, label={}",
+                            dc.id,
+                            dc.label
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // Monitor peer connection state for disconnect reasons
+        let pc_monitor = peer_connection.clone();
+        tokio::spawn(async move {
+            let mut state_rx = pc_monitor.subscribe_peer_state();
+            while let Ok(()) = state_rx.changed().await {
+                let state = *state_rx.borrow();
+                match state {
+                    rustrtc::PeerConnectionState::Disconnected
+                    | rustrtc::PeerConnectionState::Failed
+                    | rustrtc::PeerConnectionState::Closed => {
+                        if let Some(reason) = pc_monitor.disconnect_reason() {
+                            tracing::warn!(
+                                "WebRTC connection ended: {} (state: {:?})",
+                                reason,
+                                state
+                            );
+                        } else {
+                            tracing::warn!("WebRTC connection ended: state {:?}", state);
+                        }
+                        break;
+                    }
+                    _ => {
+                        tracing::debug!("Peer connection state: {:?}", state);
+                    }
+                }
+            }
+        });
+
+        // Wait for connection to be established
+        if let Err(_) = tokio::time::timeout(
+            Duration::from_secs(30),
+            peer_connection.wait_for_connected(),
+        )
+        .await
+        {
+            peer_connection.close();
+            let msg = "RPORT_SETUP_ERROR: WebRTC connection timeout\n".to_string();
+            error!("{}", msg);
+            let _ = tcp_stream.write_all(msg.as_bytes()).await;
+            let _ = tcp_stream.flush().await;
+            return Err(anyhow!("WebRTC connection timeout"));
+        }
+        peer_connection.wait_for_connected().await?;
+
+        // Wait for data channel open and handle messages
+        let (open_tx, open_rx) = tokio::sync::oneshot::channel();
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let dc_clone = data_channel.clone();
+        tokio::spawn(async move {
+            let mut open_tx = Some(open_tx);
+            while let Some(event) = dc_clone.recv().await {
+                match event {
+                    DataChannelEvent::Open => {
+                        if let Some(tx) = open_tx.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    DataChannelEvent::Message(data) => {
+                        let _ = msg_tx.send(data);
+                    }
+                    DataChannelEvent::Close => {
+                        let _ = close_tx.send(());
+                        break;
+                    }
+                }
+            }
+        });
+
+        if let Err(_) = tokio::time::timeout(Duration::from_secs(10), open_rx).await {
+            peer_connection.close();
+            let msg = "RPORT_SETUP_ERROR: Data channel open timeout\n".to_string();
+            error!("{}", msg);
+            let _ = tcp_stream.write_all(msg.as_bytes()).await;
+            let _ = tcp_stream.flush().await;
+            return Err(anyhow!("Data channel open timeout"));
+        }
 
         // Split the TCP stream
         let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();

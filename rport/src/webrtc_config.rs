@@ -60,16 +60,13 @@ impl WebRTCConfig {
         let ice_servers = self.get_ice_servers().await;
         let config = RtcConfiguration {
             ice_servers,
-            ice_connection_timeout: Duration::from_secs(120),
-            sctp_rto_initial: Duration::from_millis(1000),
-            sctp_rto_min: Duration::from_millis(500),
-            sctp_rto_max: Duration::from_secs(60),
-            sctp_max_association_retransmits: 30,
-            sctp_heartbeat_interval: Duration::from_secs(30),
-            sctp_max_heartbeat_failures: 10,
-            sctp_max_tsn_retransmits: 30,
+            sctp_rto_initial: Duration::from_millis(400),
+            sctp_rto_min: Duration::from_millis(200),
+            sctp_rto_max: Duration::from_secs(30),
+            sctp_max_association_retransmits: 15,
             sctp_receive_window: 2 * 1024 * 1024,
             enable_upnp: self.enable_upnp,
+            prefer_srflx_over_natted_host: true,
             ..Default::default()
         };
         let peer_connection = Arc::new(PeerConnection::new(config));

@@ -23,8 +23,7 @@ toml = "1.1.2"
 home = "0.5"
 bytes = "1.11.0"
 futures = "0.3"
-#rustrtc = { path = "../../rustrtc" }
-rustrtc = "0.3.67"
+rustrtc = "0.3.72"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
