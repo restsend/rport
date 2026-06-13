@@ -1,6 +1,6 @@
 [package]
 name = "rport"
-version = "0.2.28"
+version = "0.2.29"
 edition = "2021"
 description = "A p2p port forwarding client using WebRTC datachannels"
 license = "MIT"
