@@ -15,6 +15,7 @@ use crate::webrtc_config::WebRTCConfig;
 use crate::{config::IceServerConfig, OfferMessage};
 
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 
 pub async fn forward_stream_to_webrtc<R, W>(
     peer_connection: Arc<PeerConnection>,
@@ -90,6 +91,7 @@ where
 
     // Set up input -> WebRTC forwarding
     let pc_clone = peer_connection.clone();
+    let pc_keepalive = peer_connection.clone();
     let dc_id = data_channel.id;
 
     let input_task = async move {
@@ -128,6 +130,16 @@ where
         }
     });
 
+    // Periodic keepalive to prevent agent idle timeout during idle SSH sessions
+    let keepalive_task = async move {
+        loop {
+            tokio::time::sleep(KEEPALIVE_INTERVAL).await;
+            if pc_keepalive.send_data(dc_id, &[]).await.is_err() {
+                break;
+            }
+        }
+    };
+
     // Main select: wait for any side to finish
     tokio::select! {
         _ = webrtc_dead.cancelled() => {
@@ -157,6 +169,9 @@ where
         }
         _ = &mut output_task => {
             tracing::debug!("forward_stream_to_webrtc: output closed");
+        }
+        _ = keepalive_task => {
+            tracing::debug!("forward_stream_to_webrtc: keepalive failed, connection lost");
         }
     }
     Ok(())
@@ -362,6 +377,7 @@ impl CliClient {
         let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
 
         let pc_clone = peer_connection.clone();
+        let pc_keepalive = peer_connection.clone();
         let dc_id = data_channel.id;
 
         let tcp_to_webrtc = async move {
@@ -403,6 +419,16 @@ impl CliClient {
             }
         };
 
+        // Periodic keepalive to prevent agent idle timeout
+        let keepalive_task = async move {
+            loop {
+                tokio::time::sleep(KEEPALIVE_INTERVAL).await;
+                if pc_keepalive.send_data(dc_id, &[]).await.is_err() {
+                    break;
+                }
+            }
+        };
+
         // Wait for either direction to close
         tokio::select! {
             _ = close_rx => {
@@ -417,6 +443,9 @@ impl CliClient {
             }
             _ = webrtc_to_tcp => {
                 info!("WebRTC to TCP forwarding ended");
+            }
+            _ = keepalive_task => {
+                error!("Keepalive failed, WebRTC connection lost");
             }
         }
 
