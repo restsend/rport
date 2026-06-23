@@ -16,7 +16,6 @@ use crate::config::IceServerConfig;
 use crate::webrtc_config::WebRTCConfig;
 
 pub const RECONNECT_INTERVAL: u64 = 5; // seconds
-const IDLE_TIMEOUT: Duration = Duration::from_secs(180); // 3 minutes
 
 #[allow(dead_code)]
 struct ConnectionSession {
@@ -224,7 +223,6 @@ impl Agent {
                     let session_start = tokio::time::Instant::now();
                     let mut dc_msg_count: u64 = 0;
                     let mut dc_bytes_recv: u64 = 0;
-                    let mut dc_keepalive_count: u64 = 0;
 
                     // Monitor peer connection state for disconnect reasons
                     let pc_monitor = pc_clone.clone();
@@ -290,9 +288,7 @@ impl Agent {
                                 }
                             }
                             DataChannelEvent::Message(data) => {
-                                if data.is_empty() {
-                                    dc_keepalive_count += 1;
-                                } else {
+                                if !data.is_empty() {
                                     dc_msg_count += 1;
                                     dc_bytes_recv += data.len() as u64;
                                 }
@@ -306,12 +302,11 @@ impl Agent {
                                     .unwrap_or_else(|| "unknown".to_string());
                                 info!(
                                     session = session_id_str,
-                                    "Data channel closed: reason={}, duration={:.1}s, msgs={}, bytes_recv={}, keepalives={}",
+                                    "Data channel closed: reason={}, duration={:.1}s, msgs={}, bytes_recv={}",
                                     reason_str,
                                     elapsed.as_secs_f64(),
                                     dc_msg_count,
-                                    dc_bytes_recv,
-                                    dc_keepalive_count
+                                    dc_bytes_recv
                                 );
                                 cancel_token.cancel();
                                 pc_clone.close();
@@ -399,15 +394,14 @@ async fn tcp_webrtc_forwarding(
     let fwd_start = tokio::time::Instant::now();
     let tcp_to_dc_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dc_to_tcp_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let dc_to_tcp_keepalives = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
 
-    let last_activity = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
-    let idle_timeout = IDLE_TIMEOUT;
-
+    // Liveness is handled entirely by the SCTP layer (rustrtc sends HEARTBEAT
+    // chunks every ~15s and closes the association when the peer stops acking).
+    // There is no application-level idle timeout — idle SSH sessions must stay
+    // open indefinitely.
     let tcp_to_dc_counter = tcp_to_dc_bytes.clone();
-    let la_tcp = last_activity.clone();
     let recv_from_tcp = async {
         let mut buffer = [0u8; 1024];
         loop {
@@ -418,7 +412,6 @@ async fn tcp_webrtc_forwarding(
                     break;
                 }
                 Ok(n) => {
-                    *la_tcp.lock().unwrap() = tokio::time::Instant::now();
                     tcp_to_dc_counter.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                     let data = &buffer[..n];
                     if let Err(e) = peer_connection.send_data(channel_id, data).await {
@@ -438,15 +431,11 @@ async fn tcp_webrtc_forwarding(
     };
 
     let dc_to_tcp_counter = dc_to_tcp_bytes.clone();
-    let dc_keepalive_counter = dc_to_tcp_keepalives.clone();
-    let la_dc = last_activity.clone();
     let sid2 = session_id.clone();
     let recv_from_data_channel = async move {
         while let Some(msg) = tcp_write_rx.recv().await {
-            *la_dc.lock().unwrap() = tokio::time::Instant::now();
-            // Ignore zero-length messages (keepalive pings from client)
+            // Ignore zero-length messages (defensive; no longer produced).
             if msg.is_empty() {
-                dc_keepalive_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 continue;
             }
             dc_to_tcp_counter.fetch_add(msg.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -463,17 +452,6 @@ async fn tcp_webrtc_forwarding(
         let _ = tcp_write.shutdown().await;
     };
 
-    let la_idle = last_activity.clone();
-    let idle_timeout_fut = async move {
-        loop {
-            let elapsed = la_idle.lock().unwrap().elapsed();
-            if elapsed >= idle_timeout {
-                break;
-            }
-            tokio::time::sleep(idle_timeout - elapsed).await;
-        }
-    };
-
     let exit_reason;
     tokio::select! {
         _ = cancel_token.cancelled() => {
@@ -485,24 +463,19 @@ async fn tcp_webrtc_forwarding(
         _ = recv_from_tcp => {
             exit_reason = "tcp_closed";
         }
-        _ = idle_timeout_fut => {
-            exit_reason = "idle_timeout";
-        }
     }
 
     let elapsed = fwd_start.elapsed();
     let t2d = tcp_to_dc_bytes.load(std::sync::atomic::Ordering::Relaxed);
     let d2t = dc_to_tcp_bytes.load(std::sync::atomic::Ordering::Relaxed);
-    let ka = dc_to_tcp_keepalives.load(std::sync::atomic::Ordering::Relaxed);
     info!(
         session = session_id,
         client_ip,
-        "Forwarding ended: reason={}, duration={:.1}s, tcp->dc={}B, dc->tcp={}B, keepalives={}",
+        "Forwarding ended: reason={}, duration={:.1}s, tcp->dc={}B, dc->tcp={}B",
         exit_reason,
         elapsed.as_secs_f64(),
         t2d,
-        d2t,
-        ka
+        d2t
     );
 
     drop(tcp_read);
