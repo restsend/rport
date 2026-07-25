@@ -6,8 +6,10 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
 };
+use tracing::info;
 use tracing_subscriber::{self, filter::EnvFilter};
 mod cli;
+mod dtls_handler;
 
 pub fn get_first_non_loopback_interface() -> Result<IpAddr> {
     for i in get_if_addrs::get_if_addrs()? {
@@ -47,8 +49,13 @@ async fn main() -> anyhow::Result<()> {
     let turn_server = Arc::new(TurnServer::new(cli.disable_turn, turn_addr, public_ip).await?);
     turn_server.start().await.ok();
 
-    // Start TURN server in background
-    let turn_server_clone = turn_server.clone();
+    // Start DTLS signaling server (if configured)
+    if let Some(dtls_addr) = &cli.dtls_addr {
+        info!("Starting DTLS signaling server on {}", dtls_addr);
+        let _dtls_handle = dtls_handler::DtlsHandler::listen(dtls_addr.clone(), None).await?;
+    }
+
+    // Start HTTP server
     let app = create_router(turn_server);
     let listener = tokio::net::TcpListener::bind(&cli.addr).await?;
     println!(
@@ -64,6 +71,5 @@ async fn main() -> anyhow::Result<()> {
     .await
     .ok();
 
-    turn_server_clone.close().await.ok();
     Ok(())
 }

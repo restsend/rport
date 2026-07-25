@@ -4,9 +4,21 @@ use clap::Parser;
 #[command(name = "rport-server")]
 #[command(about = "Remote port forwarding server")]
 pub struct ServerCli {
-    /// Server bind address
+    /// HTTP server bind address
     #[arg(short, long, default_value = "0.0.0.0:3000")]
     pub addr: String,
+
+    /// DTLS server bind address (e.g. 0.0.0.0:8443)
+    #[arg(long = "dtls-addr")]
+    pub dtls_addr: Option<String>,
+
+    /// DTLS certificate path
+    #[arg(long = "dtls-cert")]
+    pub dtls_cert: Option<String>,
+
+    /// DTLS private key path
+    #[arg(long = "dtls-key")]
+    pub dtls_key: Option<String>,
 
     /// Disable TURN server
     #[arg(long, default_value_t = false)]
