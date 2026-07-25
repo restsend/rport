@@ -244,6 +244,8 @@ impl DtlsHandler {
                                 client_ip: addr.to_string(),
                                 sender: answer_tx,
                             });
+                            let (candidate_tx, candidate_rx) = mpsc::unbounded_channel::<String>();
+                            state_c.pending_candidates.write().await.insert(uuid, candidate_tx);
                             let server_message = ServerMessage {
                                 message_type: "offer".to_string(),
                                 data: serde_json::json!({
@@ -255,6 +257,7 @@ impl DtlsHandler {
                             if http_agent.sender.send(server_message).is_err() {
                                 warn!("Failed to send offer via SSE to agent '{}'", agent_id);
                                 state_c.pending_offers.write().await.remove(&uuid);
+                                state_c.pending_candidates.write().await.remove(&uuid);
                                 let _ = send_msg(&dtls_c, &SignalingMessage::Error {
                                     session_id: session_id.clone(),
                                     reason: format!("Agent '{}' unavailable", agent_id),
@@ -269,11 +272,13 @@ impl DtlsHandler {
                                         answer_sdp: answer,
                                     }).await;
                                     info!("Offer/answer bridge complete for agent '{}'", agent_id);
-                                    Self::client_loop_bridge(dtls_c, &mut data_rx, state_c, sid, aid).await;
+                                    Self::client_loop_bridge(dtls_c, &mut data_rx, state_c, sid.clone(), aid, uuid, candidate_rx).await;
+                                    sessions_c.write().await.remove(&sid);
                                 }
                                 _ => {
                                     warn!("Answer timeout for bridged agent '{}'", agent_id);
                                     state_c.pending_offers.write().await.remove(&uuid);
+                                    state_c.pending_candidates.write().await.remove(&uuid);
                                     let _ = send_msg(&dtls_c, &SignalingMessage::Error {
                                         session_id: session_id.clone(),
                                         reason: format!("Agent '{}' answer timeout", agent_id),
@@ -457,10 +462,9 @@ impl DtlsHandler {
         state: AppState,
         session_id: String,
         agent_id: String,
+        uuid: Uuid,
+        mut candidate_rx: mpsc::UnboundedReceiver<String>,
     ) {
-        let (candidate_tx, mut candidate_rx) = mpsc::unbounded_channel::<String>();
-        state.pending_candidates.write().await.insert(session_id.clone(), candidate_tx);
-
         let http_agent = Self::find_http_agent(&state, &agent_id).await;
 
         loop {
@@ -514,7 +518,7 @@ impl DtlsHandler {
             }
         }
 
-        state.pending_candidates.write().await.remove(&session_id);
+        state.pending_candidates.write().await.remove(&uuid);
         info!("Bridge session {} ended", session_id);
     }
 }

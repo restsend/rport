@@ -262,17 +262,17 @@ pub async fn submit_answer(
     }
 }
 pub async fn submit_candidate(
-    Path(session_id): Path<String>,
+    Path(uuid): Path<Uuid>,
     State(state): State<AppState>,
     Json(candidate_msg): Json<CandidateMessage>,
 ) -> impl IntoResponse {
-    let pending = state.pending_candidates.read().await.get(&session_id).cloned();
+    let pending = state.pending_candidates.read().await.get(&uuid).cloned();
     if let Some(tx) = pending {
         if tx.send(candidate_msg.candidate).is_ok() {
             return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
         }
     }
-    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "session not found"})))
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "offer not found"})))
 }
 
 pub async fn get_iceservers(State(state): State<AppState>) -> impl IntoResponse {
@@ -303,7 +303,7 @@ pub fn create_router_with_state(state: AppState) -> Router {
         .route("/rport/connect", get(connect_sse))
         .route("/rport/offer", post(create_offer))
         .route("/rport/answer/{uuid}", post(submit_answer))
-        .route("/rport/candidate/{session_id}", post(submit_candidate))
+        .route("/rport/candidate/{uuid}", post(submit_candidate))
         .with_state(state)
         .layer(
             tower_http::cors::CorsLayer::new()

@@ -37,7 +37,7 @@ use crate::handler::{AgentConnection, PendingOffer};
 pub struct AppState {
     pub agents: Arc<RwLock<HashMap<String, AgentConnection>>>,
     pub pending_offers: Arc<RwLock<HashMap<Uuid, PendingOffer>>>,
-    pub pending_candidates: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<String>>>>,
+    pub pending_candidates: Arc<RwLock<HashMap<Uuid, mpsc::UnboundedSender<String>>>>,
     pub turn_server: Arc<TurnServer>,
 }
 
