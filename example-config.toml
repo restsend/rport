@@ -30,6 +30,17 @@ urls = ["stun:stun.l.google.com:19302"]
 [[ice_servers]]
 urls = ["stun:restsend.com:3478"]
 
+# Advanced WebRTC / SCTP settings (optional, shown with defaults)
+# ice_connection_timeout = 300
+# ice_disconnect_threshold = 30
+# ice_disconnect_grace = 15
+# sctp_rto_initial_ms = 400
+# sctp_rto_min_ms = 200
+# sctp_rto_max_sec = 30
+# sctp_max_association_retransmits = 20
+# sctp_receive_window_kb = 2048
+# enable_upnp = true
+
 # Additional STUN servers for redundancy
 # [[ice_servers]]
 # urls = ["stun:stun1.l.google.com:19302"]

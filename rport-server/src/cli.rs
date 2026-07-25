@@ -30,4 +30,8 @@ pub struct ServerCli {
     /// Public IP address for TURN server
     #[arg(long)]
     pub public_ip: Option<String>,
+
+    /// Enable debug logging
+    #[arg(long, default_value_t = false)]
+    pub debug: bool,
 }

@@ -1,81 +1,66 @@
 use anyhow::Result;
-use reqwest::Client;
 use rustrtc::{IceServer, PeerConnection, RtcConfiguration};
 use std::{sync::Arc, time::Duration};
 
 use crate::config::IceServerConfig;
 
+use crate::config::RportConfig;
+
 #[derive(Clone)]
 pub struct WebRTCConfig {
-    pub server: String,
-    pub token: String,
     pub ice_servers: Vec<IceServerConfig>,
     pub enable_upnp: bool,
+    pub ice_disconnect_threshold: Option<Duration>,
+    pub ice_disconnect_grace: Option<Duration>,
+    pub ice_connection_timeout: Option<Duration>,
+    pub sctp_rto_initial: Option<Duration>,
+    pub sctp_rto_min: Option<Duration>,
+    pub sctp_rto_max: Option<Duration>,
+    pub sctp_max_association_retransmits: Option<u32>,
+    pub sctp_receive_window: Option<usize>,
 }
 
 impl WebRTCConfig {
     pub fn new(
-        server: String,
-        token: String,
+        _server: String,
+        _token: String,
         ice_servers: Vec<IceServerConfig>,
         enable_upnp: bool,
+        cfg: &RportConfig,
     ) -> Self {
         Self {
-            server,
-            token,
             ice_servers,
             enable_upnp,
+            ice_disconnect_threshold: cfg.ice_disconnect_threshold.map(Duration::from_secs),
+            ice_disconnect_grace: cfg.ice_disconnect_grace.map(Duration::from_secs),
+            ice_connection_timeout: cfg.ice_connection_timeout.map(Duration::from_secs),
+            sctp_rto_initial: cfg.sctp_rto_initial_ms.map(Duration::from_millis),
+            sctp_rto_min: cfg.sctp_rto_min_ms.map(Duration::from_millis),
+            sctp_rto_max: cfg.sctp_rto_max_sec.map(Duration::from_secs),
+            sctp_max_association_retransmits: cfg.sctp_max_association_retransmits,
+            sctp_receive_window: cfg.sctp_receive_window_kb.map(|kb| kb * 1024),
         }
     }
 
-    pub async fn get_ice_servers(&self) -> Vec<IceServer> {
-        if self.ice_servers.len() > 0 {
-            return self
-                .ice_servers
-                .clone()
-                .into_iter()
-                .map(|c| c.into())
-                .collect();
+    pub fn get_ice_servers(&self) -> Vec<IceServer> {
+        if !self.ice_servers.is_empty() {
+            return self.ice_servers.clone().into_iter().map(|c| c.into()).collect();
         }
-        let url = format!("{}/rport/iceservers?token={}", self.server, self.token);
-        let response = match Client::new().get(&url).send().await {
-            Ok(resp) => resp,
-            Err(_) => {
-                return vec![IceServerConfig::default().into()];
-            }
-        };
-
-        if !response.status().is_success() {
-            return vec![IceServerConfig::default().into()];
-        }
-        let ice_servers: Vec<IceServer> = response
-            .json::<Vec<IceServerConfig>>()
-            .await
-            .map(|configs| configs.into_iter().map(|c| c.into()).collect())
-            .unwrap_or_default();
-        ice_servers
+        vec![IceServerConfig::default().into()]
     }
 
     pub async fn create_peer_connection(&self) -> Result<Arc<PeerConnection>> {
-        let ice_servers = self.get_ice_servers().await;
+        let ice_servers = self.get_ice_servers();
         let config = RtcConfiguration {
             ice_servers,
-            sctp_rto_initial: Duration::from_millis(400),
-            sctp_rto_min: Duration::from_millis(200),
-            sctp_rto_max: Duration::from_secs(30),
-            sctp_max_association_retransmits: 20,
-            sctp_receive_window: 2 * 1024 * 1024,
-            // Tunnel robustness on lossy links:
-            // - SCTP fixes in rustrtc 0.3.98 (no abandon of reliable chunks,
-            //   burst retransmit, RTO snap-back, cwnd halve-not-collapse) make
-            //   loss recovery fast and never deadlock.
-            // - ICE stays Connected through transient jitter; a sustained loss
-            //   surfaces as PeerConnectionState::Disconnected (rustrtc keeps
-            //   SCTP alive). rport's grace timer then waits briefly for the
-            //   path to recover before giving up, instead of hanging for the
-            //   full ice_connection_timeout.
-            ice_connection_timeout: Duration::from_secs(300),
-            ice_disconnect_threshold: Duration::from_secs(30),
+            sctp_rto_initial: self.sctp_rto_initial.unwrap_or_else(|| Duration::from_millis(400)),
+            sctp_rto_min: self.sctp_rto_min.unwrap_or_else(|| Duration::from_millis(200)),
+            sctp_rto_max: self.sctp_rto_max.unwrap_or_else(|| Duration::from_secs(30)),
+            sctp_max_association_retransmits: self.sctp_max_association_retransmits.unwrap_or(20),
+            sctp_receive_window: self.sctp_receive_window.unwrap_or(2 * 1024 * 1024),
+            ice_connection_timeout: self.ice_connection_timeout.unwrap_or_else(|| Duration::from_secs(300)),
+            ice_disconnect_threshold: self.ice_disconnect_threshold.unwrap_or_else(|| Duration::from_secs(30)),
+            ice_disconnect_grace: self.ice_disconnect_grace.unwrap_or_else(|| Duration::from_secs(15)),
             enable_upnp: self.enable_upnp,
             prefer_srflx_over_natted_host: true,
             ..Default::default()

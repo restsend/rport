@@ -6,23 +6,28 @@ use rustrtc::transports::ice::IceSocketWrapper;
 use rustrtc::transports::PacketReceiver;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::SystemTime;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-//=== Re-using the same signaling message types from rport crate ===
-// For the server, we need compatible types.
+//=== Unified signaling message types (compatible with rport crate) ===
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Target {
+    pub host: Option<String>,
+    pub port: u16,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
-pub enum DtlsMessage {
+pub enum SignalingMessage {
     #[serde(rename = "register")]
-    Register { token: String, id: String, fingerprint: String },
+    Register { token: String, id: String },
     #[serde(rename = "offer")]
-    Offer { session_id: String, agent_id: String, offer_sdp: String },
+    Offer { session_id: String, agent_id: String, offer_sdp: String, targets: Option<Vec<Target>> },
     #[serde(rename = "answer")]
     Answer { session_id: String, answer_sdp: String },
     #[serde(rename = "candidate")]
@@ -37,7 +42,7 @@ pub enum DtlsMessage {
     Pong,
 }
 
-fn encode_msg(msg: &DtlsMessage) -> Result<Vec<u8>> {
+fn encode_msg(msg: &SignalingMessage) -> Result<Vec<u8>> {
     let json = serde_json::to_string(msg)?;
     let len = json.len();
     let mut buf = Vec::with_capacity(4 + len);
@@ -46,7 +51,7 @@ fn encode_msg(msg: &DtlsMessage) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-async fn recv_msg(rx: &mut mpsc::UnboundedReceiver<Bytes>) -> Result<DtlsMessage> {
+async fn recv_msg(rx: &mut mpsc::UnboundedReceiver<Bytes>) -> Result<SignalingMessage> {
     let data = rx.recv().await.ok_or_else(|| anyhow!("DTLS channel closed"))?;
     if data.len() < 4 {
         return Err(anyhow!("Frame too short"));
@@ -58,11 +63,18 @@ async fn recv_msg(rx: &mut mpsc::UnboundedReceiver<Bytes>) -> Result<DtlsMessage
     Ok(serde_json::from_slice(&data[4..4 + msg_len])?)
 }
 
-struct AgentSession {
-    _token: String,
-    _id: String,
+async fn send_msg(dtls: &DtlsTransport, msg: &SignalingMessage) -> Result<()> {
+    let data = encode_msg(msg)?;
+    dtls.send(Bytes::from(data)).await?;
+    Ok(())
+}
+
+//=== Session types ===
+
+#[derive(Clone)]
+struct ClientSession {
     dtls: Arc<DtlsTransport>,
-    _last_ping: SystemTime,
+    agent_id: String,
 }
 
 pub struct DtlsHandler;
@@ -84,19 +96,19 @@ pub fn load_certificate(cert_path: &Path, key_path: &Path) -> Result<Certificate
 }
 
 impl DtlsHandler {
-
-    /// Start DTLS listener. Returns a JoinHandle that must be awaited.
+    /// Start DTLS signaling server. Returns a JoinHandle.
     pub async fn listen(addr: String, cert: Option<Certificate>) -> Result<tokio::task::JoinHandle<()>> {
         let socket = Arc::new(UdpSocket::bind(&addr).await?);
         let cert = cert.unwrap_or_else(|| dtls::generate_certificate().expect("gen cert"));
         let fingerprint = dtls::fingerprint(&cert);
-        info!("DTLS server listening on {}, fingerprint: {}", addr, fingerprint);
+        info!("DTLS signaling server listening on {}, fingerprint: {}", addr, fingerprint);
 
-        let agents: Arc<RwLock<HashMap<String, AgentSession>>> = Arc::new(RwLock::new(HashMap::new()));
-        let agents_clone = agents.clone();
+        let agents: Arc<RwLock<HashMap<String, Arc<DtlsTransport>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let sessions: Arc<RwLock<HashMap<String, ClientSession>>> = Arc::new(RwLock::new(HashMap::new()));
+        let connect_counts: Arc<RwLock<HashMap<String, usize>>> = Arc::new(RwLock::new(HashMap::new()));
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = Self::run_loop(socket, cert, agents_clone).await {
+            if let Err(e) = Self::run_loop(socket, cert, agents, sessions, connect_counts).await {
                 error!("DTLS handler error: {}", e);
             }
         });
@@ -107,22 +119,28 @@ impl DtlsHandler {
     async fn run_loop(
         socket: Arc<UdpSocket>,
         cert: Certificate,
-        agents: Arc<RwLock<HashMap<String, AgentSession>>>,
+        agents: Arc<RwLock<HashMap<String, Arc<DtlsTransport>>>>,
+        sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
+        connect_counts: Arc<RwLock<HashMap<String, usize>>>,
     ) -> Result<()> {
+        let mut peers: HashMap<SocketAddr, (Arc<IceConn>, tokio::task::JoinHandle<()>)> = HashMap::new();
+        let mut buf = [0u8; 2000];
+
         loop {
-            let mut buf = [0u8; 2000];
             let (len, peer_addr) = match socket.recv_from(&mut buf).await {
                 Ok(v) => v,
                 Err(e) => { warn!("DTLS recv error: {}", e); continue; }
             };
-            let first_packet = Bytes::copy_from_slice(&buf[..len]);
+            let packet = Bytes::copy_from_slice(&buf[..len]);
 
-            let peer_socket = match UdpSocket::bind("127.0.0.1:0").await {
-                Ok(s) => Arc::new(s),
-                Err(e) => { warn!("Failed to bind socket: {}", e); continue; }
-            };
+            if let Some((conn, _)) = peers.get(&peer_addr) {
+                let mut mb = Vec::new();
+                PacketReceiver::receive(conn.as_ref(), packet, peer_addr, &mut mb).await;
+                continue;
+            }
 
-            let (tx, rx) = watch::channel(Some(IceSocketWrapper::Udp(peer_socket.clone())));
+            // New peer
+            let (tx, rx) = watch::channel(Some(IceSocketWrapper::Udp(socket.clone())));
             let conn = IceConn::new(rx, peer_addr, None);
             drop(tx);
 
@@ -132,91 +150,245 @@ impl DtlsHandler {
                 Ok(v) => v,
                 Err(e) => { warn!("Failed to create DTLS: {}", e); continue; }
             };
-
             conn.set_dtls_receiver(dtls.clone());
 
-            // Feed first packet
             let mut mb = Vec::new();
-            PacketReceiver::receive(conn.as_ref(), first_packet, peer_addr, &mut mb).await;
-
-            // Background task to feed remaining packets from this peer
-            let conn_clone = conn.clone();
-            let sk = socket.clone();
-            let addr = peer_addr;
-            tokio::spawn(async move {
-                let mut buf2 = [0u8; 2000];
-                loop {
-                    let (len, from) = match sk.recv_from(&mut buf2).await {
-                        Ok(v) => v, Err(_) => break,
-                    };
-                    if from != addr { continue; }
-                    let pkt = Bytes::copy_from_slice(&buf2[..len]);
-                    let mut mb2 = Vec::new();
-                    PacketReceiver::receive(conn_clone.as_ref(), pkt, from, &mut mb2).await;
-                }
-            });
+            PacketReceiver::receive(conn.as_ref(), packet, peer_addr, &mut mb).await;
 
             tokio::spawn(runner);
 
-            let agents_clone = agents.clone();
-            tokio::spawn(async move {
-                // Wait for DTLS handshake
-                let mut state_rx = dtls.subscribe_state();
+            let addr = peer_addr;
+            let agents_c = agents.clone();
+            let sessions_c = sessions.clone();
+            let counts_c = connect_counts.clone();
+            let dtls_c = dtls.clone();
+
+            let feed_handle = tokio::spawn(async move {
+                let mut state_rx = dtls_c.subscribe_state();
                 loop {
-                    if let DtlsState::Connected(_, _) = *state_rx.borrow() { break; }
-                    if state_rx.changed().await.is_err() { return; }
+                    if let DtlsState::Connected(_, _) = *state_rx.borrow() {
+                        info!("DTLS handshake succeeded: {}", addr);
+                        break;
+                    }
+                    if state_rx.changed().await.is_err() {
+                        warn!("DTLS handshake failed for {}", addr);
+                        return;
+                    }
                 }
 
-                info!("DTLS peer connected from {}", peer_addr);
-
-                // Receive first message (register or offer)
                 let mut data_rx = data_rx;
-                let msg = match recv_msg(&mut data_rx).await {
+                let first_msg = match recv_msg(&mut data_rx).await {
                     Ok(m) => m,
                     Err(e) => {
-                        warn!("Failed to receive first message from {}: {}", peer_addr, e);
-                        dtls.close();
+                        warn!("Failed to read first message from {}: {}", addr, e);
                         return;
                     }
                 };
 
-                match msg {
-                    DtlsMessage::Register { token, id, fingerprint: _ } => {
-                        let key = format!("{}:{}", token, id);
-                        let agent = AgentSession {
-                            _token: token, _id: id, dtls: dtls.clone(),
-                            _last_ping: SystemTime::now(),
+                match first_msg {
+                    SignalingMessage::Register { token: _, id } => {
+                        let count = {
+                            let mut cc = counts_c.write().await;
+                            let c = cc.entry(id.clone()).or_insert(0);
+                            *c += 1;
+                            *c
                         };
-                        agents_clone.write().await.insert(key.clone(), agent);
-                        info!("Agent '{}' registered via DTLS", key);
+                        let start = tokio::time::Instant::now();
+                        info!("Agent '{}' registered from {} (connection #{})", id, addr, count);
+                        let agents_for_loop = agents_c.clone();
+                        agents_c.write().await.insert(id.clone(), dtls_c.clone());
+                        Self::agent_loop(dtls_c, &mut data_rx, agents_for_loop, sessions_c, id.clone()).await;
+                        agents_c.write().await.remove(&id);
+                        info!("Agent '{}' disconnected (lifetime: {:.1}s, total connections: {})",
+                              id, start.elapsed().as_secs_f64(), count);
                     }
-                    DtlsMessage::Offer { session_id, agent_id, offer_sdp } => {
-                        let _agent_key = format!("client:{}", agent_id);
-                        info!("Offer from client for agent '{}'", _agent_key);
-                        let agents = agents_clone.read().await;
-                        if let Some(agent) = agents.get(&_agent_key) {
-                            if let Ok(data) = encode_msg(&DtlsMessage::Offer {
+                    SignalingMessage::Offer { session_id, agent_id, offer_sdp, targets } => {
+                        info!("Offer from client for agent '{}' (session: {}) from {}", agent_id, session_id, addr);
+                        let sid = session_id.clone();
+                        let aid = agent_id.clone();
+                        sessions_c.write().await.insert(session_id.clone(), ClientSession {
+                            dtls: dtls_c.clone(),
+                            agent_id: agent_id.clone(),
+                        });
+                        let agent_dtls = agents_c.read().await.get(&agent_id).cloned();
+                        if let Some(agent_dtls) = agent_dtls {
+                            let offer_msg = SignalingMessage::Offer {
                                 session_id: session_id.clone(),
                                 agent_id: agent_id.clone(),
                                 offer_sdp,
-                            }) {
-                                let _ = agent.dtls.send(Bytes::from(data)).await;
-                                info!("Offer forwarded to agent '{}'", _agent_key);
+                                targets,
+                            };
+                            if let Err(e) = send_msg(&agent_dtls, &offer_msg).await {
+                                warn!("Failed to forward offer to agent '{}': {}", agent_id, e);
+                                let _ = send_msg(&dtls_c, &SignalingMessage::Error {
+                                    session_id,
+                                    reason: format!("Agent '{}' unavailable", agent_id),
+                                }).await;
+                                sessions_c.write().await.remove(&sid);
+                                return;
                             }
+                            Self::client_loop(dtls_c, &mut data_rx, sessions_c, agents_c, sid, aid).await;
                         } else {
-                            let err = encode_msg(&DtlsMessage::Error {
-                                session_id, reason: format!("Agent '{}' not found", _agent_key),
-                            }).unwrap();
-                            let _ = dtls.send(Bytes::from(err)).await;
+                            warn!("Agent '{}' not found for session {}", agent_id, session_id);
+                            let _ = send_msg(&dtls_c, &SignalingMessage::Error {
+                                session_id,
+                                reason: format!("Agent '{}' not found", agent_id),
+                            }).await;
+                            sessions_c.write().await.remove(&sid);
                         }
                     }
                     other => {
-                        warn!("Unexpected first message from {}: {:?}", peer_addr, other);
+                        warn!("Unexpected first message from {}: {:?}", addr, other);
                     }
                 }
-
-                dtls.close();
             });
+
+            peers.insert(peer_addr, (conn, feed_handle));
         }
+    }
+
+    async fn agent_loop(
+        dtls: Arc<DtlsTransport>,
+        data_rx: &mut mpsc::UnboundedReceiver<Bytes>,
+        _agents: Arc<RwLock<HashMap<String, Arc<DtlsTransport>>>>,
+        sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
+        agent_id: String,
+    ) {
+        // Keepalive: send Ping to agents periodically
+        let ping_handle = {
+            let dtls = dtls.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+                    if send_msg(&dtls, &SignalingMessage::Ping).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let msg_loop = async {
+            loop {
+                let msg = match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(30),
+                    recv_msg(data_rx),
+                ).await {
+                    Ok(Ok(m)) => m,
+                    Ok(Err(e)) => {
+                        warn!("Agent '{}' recv error: {}", agent_id, e);
+                        break;
+                    }
+                    Err(_) => {
+                        warn!("Agent '{}' recv timeout", agent_id);
+                        break;
+                    }
+                };
+
+                match msg {
+                    SignalingMessage::Answer { session_id, answer_sdp } => {
+                        let client = sessions.read().await.get(&session_id).cloned();
+                        if let Some(client) = client {
+                            if let Err(e) = send_msg(&client.dtls, &SignalingMessage::Answer {
+                                session_id, answer_sdp,
+                            }).await {
+                                warn!("Failed to forward answer to client: {}", e);
+                            }
+                        }
+                    }
+                    SignalingMessage::Candidate { session_id, candidate } => {
+                        let client = sessions.read().await.get(&session_id).cloned();
+                        if let Some(client) = client {
+                            let _ = send_msg(&client.dtls, &SignalingMessage::Candidate {
+                                session_id, candidate,
+                            }).await;
+                        }
+                    }
+                    SignalingMessage::EndOfCandidates { session_id } => {
+                        let client = sessions.read().await.get(&session_id).cloned();
+                        if let Some(client) = client {
+                            let _ = send_msg(&client.dtls, &SignalingMessage::EndOfCandidates {
+                                session_id,
+                            }).await;
+                        }
+                    }
+                    SignalingMessage::Ping => {
+                        let _ = send_msg(&dtls, &SignalingMessage::Pong).await;
+                    }
+                    SignalingMessage::Pong => {}
+                    SignalingMessage::Error { reason, .. } => {
+                        warn!("Agent '{}' error: {}", agent_id, reason);
+                    }
+                    other => {
+                        debug!("Agent '{}' unexpected message: {:?}", agent_id, other);
+                    }
+                }
+            }
+        };
+
+        tokio::select! {
+            _ = msg_loop => {}
+            _ = ping_handle => {}
+        }
+
+        // Cleanup: remove all sessions for this agent
+        let mut sessions_w = sessions.write().await;
+        sessions_w.retain(|_, s| s.agent_id != agent_id);
+    }
+
+    async fn client_loop(
+        dtls: Arc<DtlsTransport>,
+        data_rx: &mut mpsc::UnboundedReceiver<Bytes>,
+        sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
+        agents: Arc<RwLock<HashMap<String, Arc<DtlsTransport>>>>,
+        session_id: String,
+        agent_id: String,
+    ) {
+        loop {
+            let msg = match tokio::time::timeout(
+                tokio::time::Duration::from_secs(60),
+                recv_msg(data_rx),
+            ).await {
+                Ok(Ok(m)) => m,
+                Ok(Err(e)) => {
+                    warn!("Client session {} recv error: {}", session_id, e);
+                    break;
+                }
+                Err(_) => {
+                    info!("Client session {} idle timeout", session_id);
+                    break;
+                }
+            };
+
+            match msg {
+                SignalingMessage::Candidate { session_id: sid, candidate } => {
+                    if let Some(agent_dtls) = agents.read().await.get(&agent_id) {
+                        let _ = send_msg(agent_dtls, &SignalingMessage::Candidate {
+                            session_id: sid, candidate,
+                        }).await;
+                    }
+                }
+                SignalingMessage::EndOfCandidates { session_id: sid } => {
+                    if let Some(agent_dtls) = agents.read().await.get(&agent_id) {
+                        let _ = send_msg(agent_dtls, &SignalingMessage::EndOfCandidates {
+                            session_id: sid,
+                        }).await;
+                    }
+                }
+                SignalingMessage::Ping => {
+                    let _ = send_msg(&dtls, &SignalingMessage::Pong).await;
+                }
+                SignalingMessage::Pong => {}
+                SignalingMessage::Error { reason, .. } => {
+                    warn!("Client session {} error: {}", session_id, reason);
+                    break;
+                }
+                other => {
+                    debug!("Client session {} unexpected message: {:?}", session_id, other);
+                }
+            }
+        }
+
+        sessions.write().await.remove(&session_id);
+        info!("Client session {} ended", session_id);
     }
 }

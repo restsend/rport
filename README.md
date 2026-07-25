@@ -88,6 +88,31 @@ server = "http://your-server:3000"
 urls = ["stun:stun.l.google.com:19302"]
 ```
 
+### Advanced WebRTC Settings
+
+These can be added to `~/.rport.toml` for tuning:
+
+```toml
+# ICE disconnect detection: time without traffic before ICE goes Disconnected (s)
+ice_disconnect_threshold = 30
+
+# ICE disconnect grace: how long to wait in Disconnected before tearing down (s)
+ice_disconnect_grace = 15
+
+# ICE hard timeout: total time without traffic before ICE goes Failed (s)
+ice_connection_timeout = 300
+
+# SCTP retransmission parameters
+sctp_rto_initial_ms = 400     # Initial RTO (ms)
+sctp_rto_min_ms = 200          # Minimum RTO (ms)
+sctp_rto_max_sec = 30          # Maximum RTO (s)
+sctp_max_association_retransmits = 20
+sctp_receive_window_kb = 2048  # Receiver window (KB)
+
+# UPnP port mapping for NAT traversal
+enable_upnp = true
+```
+
 ## Advanced Usage
 
 - **Daemon Mode**: Append `--daemon --log-file rport.log` to the command.

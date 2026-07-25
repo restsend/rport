@@ -23,7 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
-rustrtc = "0.3.99"
+rustrtc = "0.3.101"
 async-stream = "0.3.6"
 tower-http = { version = "0.6.7", features = ["cors", "trace"] }
 clap = { version = "4.5.53", features = ["derive"] }

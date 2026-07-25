@@ -22,18 +22,16 @@ pub struct Target {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SignalingMessage {
+    #[serde(rename = "register")]
+    Register { token: String, id: String },
     #[serde(rename = "offer")]
-    Offer { session_id: String, token: Option<String>, offer_sdp: String, targets: Option<Vec<Target>> },
+    Offer { session_id: String, agent_id: String, offer_sdp: String, targets: Option<Vec<Target>> },
     #[serde(rename = "answer")]
     Answer { session_id: String, answer_sdp: String },
     #[serde(rename = "candidate")]
     Candidate { session_id: String, candidate: String },
     #[serde(rename = "end-of-candidates")]
     EndOfCandidates { session_id: String },
-    #[serde(rename = "register")]
-    Register { token: String, id: String, fingerprint: String },
-    #[serde(rename = "registered")]
-    Registered {},
     #[serde(rename = "error")]
     Error { session_id: String, reason: String },
     #[serde(rename = "ping")]
@@ -128,13 +126,21 @@ impl DtlsClient {
         conn.set_dtls_receiver(dtls.clone());
         tokio::spawn(runner);
 
-        // Wait for handshake
+        // Wait for handshake — log each state transition
         let mut state_rx = dtls.subscribe_state();
+        debug!("DTLS client handshake starting, initial state: {}", *state_rx.borrow());
         loop {
-            if let DtlsState::Connected(_, _) = *state_rx.borrow() { break; }
-            if state_rx.changed().await.is_err() {
-                dtls.close(); return Err(anyhow!("DTLS handshake failed to {}", addr));
+            if let DtlsState::Connected(_, _) = *state_rx.borrow() {
+                info!("DTLS client handshake succeeded: connected to {}", remote_addr);
+                break;
             }
+            if state_rx.changed().await.is_err() {
+                let last = dtls.get_state();
+                warn!("DTLS client handshake state channel closed, last state: {}", last);
+                dtls.close();
+                return Err(anyhow!("DTLS handshake failed to {}", addr));
+            }
+            debug!("DTLS client state -> {}", *state_rx.borrow());
         }
         info!("DTLS connected to {}", remote_addr);
         Ok(Self { dtls, data_rx, _reader: reader })
@@ -153,8 +159,9 @@ impl DtlsClient {
     }
 }
 
-//=== DTLS Agent (Server side) ===
+//=== DTLS Agent (Server side) — for direct DTLS listen mode (kept for testing) ===
 
+#[allow(dead_code)]
 pub struct DtlsAgent {
     socket: Arc<UdpSocket>,
     pub cert: Certificate,
@@ -162,6 +169,7 @@ pub struct DtlsAgent {
     _driver: tokio::task::JoinHandle<()>,
 }
 
+#[allow(dead_code)]
 pub struct DtlsAgentSession {
     pub dtls: Arc<DtlsTransport>,
     #[allow(dead_code)]
@@ -170,6 +178,7 @@ pub struct DtlsAgentSession {
     pub _peer_addr: SocketAddr,
 }
 
+#[allow(dead_code)]
 impl DtlsAgent {
     pub async fn bind(addr: &str, user_cert: Option<Certificate>) -> Result<Self> {
         let socket = Arc::new(UdpSocket::bind(addr).await?);
@@ -196,8 +205,6 @@ impl DtlsAgent {
         session_tx: mpsc::UnboundedSender<DtlsAgentSession>,
     ) {
         use std::collections::HashMap;
-        // Map peer_addr -> (IceConn, feed_task_handle)
-        // Prevents duplicate sessions for the same peer during handshake
         let mut sessions: HashMap<SocketAddr, (Arc<IceConn>, tokio::task::JoinHandle<()>)> = HashMap::new();
         let mut buf = [0u8; 2000];
 
@@ -208,14 +215,12 @@ impl DtlsAgent {
             };
             let packet = Bytes::copy_from_slice(&buf[..len]);
 
-            // Check if this peer already has a pending handshake session
             if let Some((conn, _)) = sessions.get(&peer_addr) {
                 let mut mb = Vec::new();
                 PacketReceiver::receive(conn.as_ref(), packet, peer_addr, &mut mb).await;
                 continue;
             }
 
-            // New peer: create IceConn sharing the main socket
             let (tx, rx) = watch::channel(Some(IceSocketWrapper::Udp(socket.clone())));
             let conn = IceConn::new(rx, peer_addr, None);
             drop(tx);
@@ -230,14 +235,10 @@ impl DtlsAgent {
 
             tokio::spawn(runner);
 
-            // Feed first packet
             let mut mb = Vec::new();
             PacketReceiver::receive(conn.as_ref(), packet, peer_addr, &mut mb).await;
 
-            // Background: wait for handshake, then send session
             let dtls_c = dtls.clone();
-            let conn_c = conn.clone();
-            let sk = socket.clone();
             let tx2 = session_tx.clone();
             let addr = peer_addr;
 
@@ -254,21 +255,9 @@ impl DtlsAgent {
                     _peer_addr: addr,
                 };
                 let _ = tx2.send(session);
-
-                // Keep feeding this peer's packets to the IceConn
-                let mut buf2 = [0u8; 2000];
-                loop {
-                    let (len, from) = match sk.recv_from(&mut buf2).await {
-                        Ok(v) => v, Err(_) => break,
-                    };
-                    if from != addr { continue; }
-                    let pkt = Bytes::copy_from_slice(&buf2[..len]);
-                    let mut mb2 = Vec::new();
-                    PacketReceiver::receive(conn_c.as_ref(), pkt, from, &mut mb2).await;
-                }
+                // Main loop handles all subsequent packet routing via sessions map
             });
 
-            // Insert into sessions map to avoid duplicate processing
             sessions.insert(peer_addr, (conn, feed_handle));
         }
     }
@@ -287,28 +276,23 @@ mod tests {
             .with_env_filter("info")
             .try_init();
 
-        // Agent: listen on a random port
         let mut agent = DtlsAgent::bind("127.0.0.1:0", None).await.unwrap();
         let agent_addr = agent.local_addr().unwrap().to_string();
         tracing::info!("DTLS agent listening on {}", agent_addr);
 
-        // Client: connect to agent
         let mut client = DtlsClient::connect(&agent_addr, None).await.unwrap();
 
-        // Agent: accept connection
         tokio::time::sleep(Duration::from_millis(300)).await;
         let mut agent_session = agent.accept().await.expect("Agent should accept connection");
 
-        // Client sends offer
         let session_id = "test-session-1".to_string();
         client.send(&SignalingMessage::Offer {
             session_id: session_id.clone(),
-            token: None,
+            agent_id: "test-agent".to_string(),
             offer_sdp: "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n".to_string(),
             targets: Some(vec![Target { host: Some("127.0.0.1".to_string()), port: 22 }]),
         }).await.unwrap();
 
-        // Agent receives offer
         let msg = tokio::time::timeout(Duration::from_secs(5), recv_message(&mut agent_session.data_rx)).await
             .expect("Timeout receiving offer").unwrap();
         match msg {
@@ -323,13 +307,11 @@ mod tests {
             other => panic!("Expected offer, got {:?}", other),
         }
 
-        // Agent sends answer
         send_message(&agent_session.dtls, &SignalingMessage::Answer {
             session_id: session_id.clone(),
             answer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n".to_string(),
         }).await.unwrap();
 
-        // Client receives answer
         let msg = tokio::time::timeout(Duration::from_secs(5), client.recv()).await
             .expect("Timeout receiving answer").unwrap();
         match msg {
