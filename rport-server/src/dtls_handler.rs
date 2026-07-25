@@ -219,6 +219,8 @@ impl DtlsHandler {
                         });
                         let agent_dtls = agents_c.read().await.get(&agent_id).cloned();
                         if let Some(agent_dtls) = agent_dtls {
+                            info!("Agent '{}' found via DTLS registry", agent_id);
+
                             let offer_msg = SignalingMessage::Offer {
                                 session_id: session_id.clone(),
                                 agent_id: agent_id.clone(),
@@ -236,7 +238,7 @@ impl DtlsHandler {
                             }
                             Self::client_loop(dtls_c, &mut data_rx, sessions_c, agents_c, sid, aid).await;
                         } else if let Some(http_agent) = Self::find_http_agent(&state_c, &agent_id).await {
-                            info!("Agent '{}' found via HTTP/SSE, bridging signaling", agent_id);
+                            info!("Agent '{}' found in HTTP/SSE registry (sid={}), bridging signaling", agent_id, session_id);
                             let uuid = Uuid::new_v4();
                             let (answer_tx, answer_rx) = oneshot::channel();
                             state_c.pending_offers.write().await.insert(uuid, PendingOffer {
@@ -451,9 +453,18 @@ impl DtlsHandler {
     }
 
     async fn find_http_agent(state: &AppState, agent_id: &str) -> Option<rport_server::handler::AgentConnection> {
-        state.agents.read().await.iter()
-            .find(|(key, _)| key.ends_with(&format!(":{}", agent_id)))
-            .map(|(_, agent)| agent.clone())
+        let agents = state.agents.read().await;
+        let match_suffix = format!(":{}", agent_id);
+        let result = agents.iter()
+            .find(|(key, _)| key.ends_with(&match_suffix))
+            .map(|(key, agent)| {
+                info!("HTTP/SSE agent '{}' found via lookup key '{}'", agent_id, key);
+                agent.clone()
+            });
+        if result.is_none() {
+            debug!("Agent '{}' not found in HTTP/SSE registry (total {} agents)", agent_id, agents.len());
+        }
+        result
     }
 
     async fn client_loop_bridge(
