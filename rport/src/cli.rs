@@ -41,6 +41,10 @@ pub struct Cli {
     #[arg(long = "upnp", default_value_t = false)]
     pub upnp: bool,
 
+    /// Wait for all ICE candidates before sending offer (needed for old HTTP/SSE agents)
+    #[arg(long = "wait-candidates")]
+    pub wait_candidates: bool,
+
     /// Daemonize the process (Unix only)
     #[arg(short = 'd', long)]
     pub daemon: bool,

@@ -224,6 +224,7 @@ pub struct CliClient {
     token: String,
     agent_id: String,
     webrtc_config: WebRTCConfig,
+    wait_candidates: bool,
 }
 
 impl CliClient {
@@ -233,6 +234,7 @@ impl CliClient {
         agent_id: &str,
         ice_servers: Option<Vec<IceServerConfig>>,
         enable_upnp: bool,
+        wait_candidates: bool,
         cfg: &RportConfig,
     ) -> Self {
         let webrtc_config = WebRTCConfig::new(
@@ -247,6 +249,7 @@ impl CliClient {
             token: token.to_string(),
             agent_id: agent_id.to_string(),
             webrtc_config,
+            wait_candidates,
         }
     }
 
@@ -287,6 +290,7 @@ impl CliClient {
             let agent_id = self.agent_id.clone();
             let stats = all_stats.clone();
             let timeout = connect_timeout;
+            let wait_candidates = self.wait_candidates;
 
             tokio::spawn(async move {
                 let listener = match TcpListener::bind(format!("127.0.0.1:{}", local_port)).await {
@@ -309,6 +313,7 @@ impl CliClient {
                                 token: tok.clone(),
                                 agent_id: agent_id.clone(),
                                 webrtc_config: webrtc_config.clone(),
+                                wait_candidates,
                             };
                             let stats = stats.clone();
                             let host_clone = host.clone();
@@ -389,7 +394,10 @@ impl CliClient {
 
         // Wait for all ICE candidates before sending offer so that
         // old HTTP/SSE agents (which ignore trickle ICE) get all candidates in the SDP
-        peer_connection.wait_for_gathering_complete().await;
+        if self.wait_candidates {
+            info!("Waiting for ICE gathering to complete (--wait-candidates)");
+            peer_connection.wait_for_gathering_complete().await;
+        }
 
         let offer_sdp = peer_connection.local_description()
             .ok_or_else(|| anyhow!("Failed to get local description"))?
@@ -511,6 +519,7 @@ impl Clone for CliClient {
             token: self.token.clone(),
             agent_id: self.agent_id.clone(),
             webrtc_config: self.webrtc_config.clone(),
+            wait_candidates: self.wait_candidates,
         }
     }
 }

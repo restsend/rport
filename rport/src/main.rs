@@ -41,6 +41,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let is_debug = cli.debug;
     let cli_allow = cli.allow.clone();
     let cli_id = cli.id.clone();
+    let wait_candidates = cli.wait_candidates;
 
     let log_env = if is_debug {
         EnvFilter::new("debug,hyper=warn,gather=warn,igd=warn,neli=warn,rustls_platform_verifier=warn")
@@ -109,7 +110,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 .init();
         }
 
-        let client = CliClient::new(srv, tok, agent_id, ice_servers, upnp, &config);
+        let client = CliClient::new(srv, tok, agent_id, ice_servers, upnp, wait_candidates, &config);
         if is_proxy_command {
             let fwd = forwards.into_iter().next().unwrap();
             client.connect_proxy_command(config.connect_timeout, &fwd.host, fwd.port).await?;
