@@ -3,9 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use rustrtc::{
     transports::sctp::{DataChannel, DataChannelConfig, DataChannelEvent},
-    IceCandidate, IceGatheringState, PeerConnection, SdpType, SessionDescription,
+    IceCandidate, IceGatheringState, PeerConnection, PeerConnectionEvent, SdpType, SessionDescription,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -61,6 +62,7 @@ pub async fn forward_stream_to_webrtc<R, W>(
     stats: Option<Arc<ForwardStats>>,
     mut input: R,
     mut output: W,
+    mut remote_msg_rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -175,9 +177,27 @@ where
     };
 
     let mut output_task = tokio::spawn(async move {
-        while let Some(data) = msg_rx.recv().await {
-            if output.write_all(&data).await.is_err() { break; }
-            if output.flush().await.is_err() { break; }
+        loop {
+            tokio::select! {
+                data = msg_rx.recv() => {
+                    match data {
+                        Some(data) => {
+                            if output.write_all(&data).await.is_err() { break; }
+                            if output.flush().await.is_err() { break; }
+                        }
+                        None => break,
+                    }
+                }
+                data = remote_msg_rx.recv() => {
+                    match data {
+                        Some(data) => {
+                            if output.write_all(&data).await.is_err() { break; }
+                            if output.flush().await.is_err() { break; }
+                        }
+                        None => break,
+                    }
+                }
+            }
         }
     });
 
@@ -239,10 +259,10 @@ impl CliClient {
         target_port: u16,
     ) -> Result<()> {
         info!("ProxyCommand: agent '{}' target {}:{}", self.agent_id, target_host, target_port);
-        let (pc, dc) = self.establish_webrtc(target_host, target_port).await?;
+        let (pc, dc, remote_rx) = self.establish_webrtc(target_host, target_port).await?;
         forward_stream_to_webrtc(
             pc, dc, connect_timeout, None,
-            tokio::io::stdin(), tokio::io::stdout(),
+            tokio::io::stdin(), tokio::io::stdout(), remote_rx,
         ).await
     }
 
@@ -294,9 +314,9 @@ impl CliClient {
                             let host_clone = host.clone();
                             tokio::spawn(async move {
                                 match client.establish_webrtc(&host_clone, port).await {
-                                    Ok((pc, dc)) => {
+                                    Ok((pc, dc, remote_rx)) => {
                                         if let Err(e) = forward_stream_to_webrtc(
-                                            pc, dc, timeout, Some(stats), reader, writer,
+                                            pc, dc, timeout, Some(stats), reader, writer, remote_rx,
                                         ).await {
                                             error!("Forwarding error: {}", e);
                                         }
@@ -323,7 +343,7 @@ impl CliClient {
         &self,
         target_host: &str,
         target_port: u16,
-    ) -> Result<(Arc<PeerConnection>, Arc<DataChannel>)> {
+    ) -> Result<(Arc<PeerConnection>, Arc<DataChannel>, tokio::sync::mpsc::UnboundedReceiver<Bytes>)> {
         let mut dtls_client = DtlsClient::connect(&self.server_url, None).await?;
         info!("DTLS connected to signaling server {}", self.server_url);
 
@@ -337,9 +357,29 @@ impl CliClient {
         };
         let data_channel = peer_connection.create_data_channel(&label, Some(dc_config))?;
 
+        let (remote_msg_tx, remote_msg_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+
         let pc_drain = peer_connection.clone();
+        let rt = remote_msg_tx.clone();
         tokio::spawn(async move {
-            while let Some(_) = pc_drain.recv().await {}
+            while let Some(event) = pc_drain.recv().await {
+                if let PeerConnectionEvent::DataChannel(dc) = event {
+                    let label = dc.label.clone();
+                    info!("Received remote data channel from agent: {}", label);
+                    let tx = rt.clone();
+                    tokio::spawn(async move {
+                        while let Some(event) = dc.recv().await {
+                            match event {
+                                DataChannelEvent::Message(data) => {
+                                    let _ = tx.send(data);
+                                }
+                                DataChannelEvent::Close => break,
+                                _ => {}
+                            }
+                        }
+                    });
+                }
+            }
         });
 
         let offer = peer_connection.create_offer().await?;
@@ -457,7 +497,7 @@ impl CliClient {
             }
         });
 
-        Ok((peer_connection, data_channel))
+        Ok((peer_connection, data_channel, remote_msg_rx))
     }
 }
 

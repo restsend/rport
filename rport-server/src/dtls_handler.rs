@@ -457,12 +457,11 @@ impl DtlsHandler {
         let match_suffix = format!(":{}", agent_id);
         let result = agents.iter()
             .find(|(key, _)| key.ends_with(&match_suffix))
-            .map(|(key, agent)| {
-                info!("HTTP/SSE agent '{}' found via lookup key '{}'", agent_id, key);
-                agent.clone()
-            });
-        if result.is_none() {
-            debug!("Agent '{}' not found in HTTP/SSE registry (total {} agents)", agent_id, agents.len());
+            .map(|(_, agent)| agent.clone());
+        if result.is_some() {
+            info!("Agent '{}' found in HTTP/SSE registry ({} total)", agent_id, agents.len());
+        } else {
+            debug!("Agent '{}' not found in HTTP/SSE registry ({} total)", agent_id, agents.len());
         }
         result
     }
