@@ -128,6 +128,15 @@ impl RportConfig {
 fn parse_forward_spec(spec: &str) -> Result<ForwardMapping> {
     let parts: Vec<&str> = spec.split(':').collect();
     match parts.len() {
+        1 => {
+            // -L port  →  shorthand for -L 127.0.0.1:port (ProxyCommand)
+            let port: u16 = parts[0].parse()?;
+            Ok(ForwardMapping {
+                local_port: None,
+                host: "127.0.0.1".to_string(),
+                port,
+            })
+        }
         2 => {
             // -L local_port:remote_port  (port forward, host=127.0.0.1)
             // or -L host:port (ProxyCommand)
@@ -160,7 +169,7 @@ fn parse_forward_spec(spec: &str) -> Result<ForwardMapping> {
             })
         }
         _ => Err(anyhow!(
-            "Invalid -L format: {}. Use local_port:host:port, local_port:port, or host:port",
+            "Invalid -L format: {}. Use port, host:port, local_port:port, or local_port:host:port",
             spec
         )),
     }
