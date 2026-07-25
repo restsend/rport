@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use cli::ServerCli;
 use dtls_handler::load_certificate;
-use rport_server::{handler::create_router, TurnServer};
+use rport_server::{handler::create_router_with_state, AppState, TurnServer};
 use std::{
     net::{IpAddr, SocketAddr},
     path::Path,
@@ -57,6 +57,9 @@ async fn main() -> anyhow::Result<()> {
     let turn_server = Arc::new(TurnServer::new(cli.disable_turn, turn_addr, public_ip).await?);
     turn_server.start().await.ok();
 
+    // Create shared AppState
+    let app_state = AppState::new_with_turn(turn_server);
+
     // Start DTLS signaling server (if configured)
     if let Some(dtls_addr) = &cli.dtls_addr {
         info!("Starting DTLS signaling server on {}", dtls_addr);
@@ -66,11 +69,11 @@ async fn main() -> anyhow::Result<()> {
             }
             _ => None,
         };
-        let _dtls_handle = dtls_handler::DtlsHandler::listen(dtls_addr.clone(), cert).await?;
+        let _dtls_handle = dtls_handler::DtlsHandler::listen(dtls_addr.clone(), cert, app_state.clone()).await?;
     }
 
     // Start HTTP server
-    let app = create_router(turn_server);
+    let app = create_router_with_state(app_state);
     let listener = tokio::net::TcpListener::bind(&cli.addr).await?;
     println!(
         "Server running on http://{}:{}",

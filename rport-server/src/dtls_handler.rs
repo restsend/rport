@@ -9,9 +9,14 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{mpsc, oneshot, watch, RwLock};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+use rport_server::handler::PendingOffer;
+use rport_server::{AppState, ServerMessage};
 
 //=== Unified signaling message types (compatible with rport crate) ===
 
@@ -97,7 +102,7 @@ pub fn load_certificate(cert_path: &Path, key_path: &Path) -> Result<Certificate
 
 impl DtlsHandler {
     /// Start DTLS signaling server. Returns a JoinHandle.
-    pub async fn listen(addr: String, cert: Option<Certificate>) -> Result<tokio::task::JoinHandle<()>> {
+    pub async fn listen(addr: String, cert: Option<Certificate>, state: AppState) -> Result<tokio::task::JoinHandle<()>> {
         let socket = Arc::new(UdpSocket::bind(&addr).await?);
         let cert = cert.unwrap_or_else(|| dtls::generate_certificate().expect("gen cert"));
         let fingerprint = dtls::fingerprint(&cert);
@@ -108,7 +113,7 @@ impl DtlsHandler {
         let connect_counts: Arc<RwLock<HashMap<String, usize>>> = Arc::new(RwLock::new(HashMap::new()));
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = Self::run_loop(socket, cert, agents, sessions, connect_counts).await {
+            if let Err(e) = Self::run_loop(socket, cert, agents, sessions, connect_counts, state).await {
                 error!("DTLS handler error: {}", e);
             }
         });
@@ -122,6 +127,7 @@ impl DtlsHandler {
         agents: Arc<RwLock<HashMap<String, Arc<DtlsTransport>>>>,
         sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
         connect_counts: Arc<RwLock<HashMap<String, usize>>>,
+        state: AppState,
     ) -> Result<()> {
         let mut peers: HashMap<SocketAddr, (Arc<IceConn>, tokio::task::JoinHandle<()>)> = HashMap::new();
         let mut buf = [0u8; 2000];
@@ -162,6 +168,7 @@ impl DtlsHandler {
             let sessions_c = sessions.clone();
             let counts_c = connect_counts.clone();
             let dtls_c = dtls.clone();
+            let state_c = state.clone();
 
             let feed_handle = tokio::spawn(async move {
                 let mut state_rx = dtls_c.subscribe_state();
@@ -228,8 +235,54 @@ impl DtlsHandler {
                                 return;
                             }
                             Self::client_loop(dtls_c, &mut data_rx, sessions_c, agents_c, sid, aid).await;
+                        } else if let Some(http_agent) = Self::find_http_agent(&state_c, &agent_id).await {
+                            info!("Agent '{}' found via HTTP/SSE, bridging signaling", agent_id);
+                            let uuid = Uuid::new_v4();
+                            let (answer_tx, answer_rx) = oneshot::channel();
+                            state_c.pending_offers.write().await.insert(uuid, PendingOffer {
+                                offer: offer_sdp.clone(),
+                                client_ip: addr.to_string(),
+                                sender: answer_tx,
+                            });
+                            let server_message = ServerMessage {
+                                message_type: "offer".to_string(),
+                                data: serde_json::json!({
+                                    "uuid": uuid,
+                                    "offer": offer_sdp,
+                                    "client_ip": addr.to_string(),
+                                }),
+                            };
+                            if http_agent.sender.send(server_message).is_err() {
+                                warn!("Failed to send offer via SSE to agent '{}'", agent_id);
+                                state_c.pending_offers.write().await.remove(&uuid);
+                                let _ = send_msg(&dtls_c, &SignalingMessage::Error {
+                                    session_id: session_id.clone(),
+                                    reason: format!("Agent '{}' unavailable", agent_id),
+                                }).await;
+                                sessions_c.write().await.remove(&sid);
+                                return;
+                            }
+                            match tokio::time::timeout(Duration::from_secs(30), answer_rx).await {
+                                Ok(Ok(answer)) => {
+                                    let _ = send_msg(&dtls_c, &SignalingMessage::Answer {
+                                        session_id: session_id.clone(),
+                                        answer_sdp: answer,
+                                    }).await;
+                                    info!("Offer/answer bridge complete for agent '{}'", agent_id);
+                                    Self::client_loop_bridge(dtls_c, &mut data_rx, state_c, sid, aid).await;
+                                }
+                                _ => {
+                                    warn!("Answer timeout for bridged agent '{}'", agent_id);
+                                    state_c.pending_offers.write().await.remove(&uuid);
+                                    let _ = send_msg(&dtls_c, &SignalingMessage::Error {
+                                        session_id: session_id.clone(),
+                                        reason: format!("Agent '{}' answer timeout", agent_id),
+                                    }).await;
+                                    sessions_c.write().await.remove(&sid);
+                                }
+                            }
                         } else {
-                            warn!("Agent '{}' not found for session {}", agent_id, session_id);
+                            warn!("Agent '{}' not found in any registry for session {}", agent_id, session_id);
                             let _ = send_msg(&dtls_c, &SignalingMessage::Error {
                                 session_id,
                                 reason: format!("Agent '{}' not found", agent_id),
@@ -390,5 +443,78 @@ impl DtlsHandler {
 
         sessions.write().await.remove(&session_id);
         info!("Client session {} ended", session_id);
+    }
+
+    async fn find_http_agent(state: &AppState, agent_id: &str) -> Option<rport_server::handler::AgentConnection> {
+        state.agents.read().await.iter()
+            .find(|(key, _)| key.ends_with(&format!(":{}", agent_id)))
+            .map(|(_, agent)| agent.clone())
+    }
+
+    async fn client_loop_bridge(
+        dtls: Arc<DtlsTransport>,
+        data_rx: &mut mpsc::UnboundedReceiver<Bytes>,
+        state: AppState,
+        session_id: String,
+        agent_id: String,
+    ) {
+        let (candidate_tx, mut candidate_rx) = mpsc::unbounded_channel::<String>();
+        state.pending_candidates.write().await.insert(session_id.clone(), candidate_tx);
+
+        let http_agent = Self::find_http_agent(&state, &agent_id).await;
+
+        loop {
+            tokio::select! {
+                msg = recv_msg(data_rx) => {
+                    match msg {
+                        Ok(SignalingMessage::Candidate { session_id: sid, candidate }) => {
+                            if let Some(ref agent) = http_agent {
+                                let msg = ServerMessage {
+                                    message_type: "candidate".to_string(),
+                                    data: serde_json::json!({
+                                        "session_id": sid,
+                                        "candidate": candidate,
+                                    }),
+                                };
+                                let _ = agent.sender.send(msg);
+                            }
+                        }
+                        Ok(SignalingMessage::EndOfCandidates { session_id: sid }) => {
+                            if let Some(ref agent) = http_agent {
+                                let msg = ServerMessage {
+                                    message_type: "end-of-candidates".to_string(),
+                                    data: serde_json::json!({"session_id": sid}),
+                                };
+                                let _ = agent.sender.send(msg);
+                            }
+                        }
+                        Ok(SignalingMessage::Ping) => {
+                            let _ = send_msg(&dtls, &SignalingMessage::Pong).await;
+                        }
+                        Ok(SignalingMessage::Pong) => {}
+                        Ok(SignalingMessage::Error { reason, .. }) => {
+                            warn!("Bridge session {} error: {}", session_id, reason);
+                            break;
+                        }
+                        Err(_) => break,
+                        _ => {}
+                    }
+                }
+                candidate = candidate_rx.recv() => {
+                    match candidate {
+                        Some(candidate) => {
+                            let _ = send_msg(&dtls, &SignalingMessage::Candidate {
+                                session_id: session_id.clone(),
+                                candidate,
+                            }).await;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        state.pending_candidates.write().await.remove(&session_id);
+        info!("Bridge session {} ended", session_id);
     }
 }

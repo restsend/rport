@@ -1,4 +1,4 @@
-use crate::{AnswerMessage, OfferMessage, ServerMessage};
+use crate::{AnswerMessage, CandidateMessage, OfferMessage, ServerMessage};
 use anyhow::anyhow;
 use axum::{
     extract::{Path, Query, State},
@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 pub const PING_INTERVAL: u64 = 30; // seconds
 
+#[derive(Clone)]
 pub struct AgentConnection {
     pub id: String,
     pub token: String,
@@ -260,6 +261,20 @@ pub async fn submit_answer(
         ),
     }
 }
+pub async fn submit_candidate(
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+    Json(candidate_msg): Json<CandidateMessage>,
+) -> impl IntoResponse {
+    let pending = state.pending_candidates.read().await.get(&session_id).cloned();
+    if let Some(tx) = pending {
+        if tx.send(candidate_msg.candidate).is_ok() {
+            return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+        }
+    }
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "session not found"})))
+}
+
 pub async fn get_iceservers(State(state): State<AppState>) -> impl IntoResponse {
     // Generate temporary TURN credentials
 
@@ -282,14 +297,13 @@ pub async fn get_iceservers(State(state): State<AppState>) -> impl IntoResponse 
 
     (StatusCode::OK, Json(ice_servers))
 }
-pub fn create_router(turn_server: std::sync::Arc<crate::TurnServer>) -> Router {
-    let state = AppState::new_with_turn(turn_server);
-
+pub fn create_router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/rport/iceservers", get(get_iceservers))
         .route("/rport/connect", get(connect_sse))
         .route("/rport/offer", post(create_offer))
         .route("/rport/answer/{uuid}", post(submit_answer))
+        .route("/rport/candidate/{session_id}", post(submit_candidate))
         .with_state(state)
         .layer(
             tower_http::cors::CorsLayer::new()
