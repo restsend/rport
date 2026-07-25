@@ -64,16 +64,25 @@ where
         return Err(anyhow!("Data channel open timeout"));
     }
 
+    // How long to wait for the ICE path to recover after a Disconnected before
+    // declaring the tunnel dead. rustrtc keeps the SCTP association alive across
+    // transient Disconnected, so a recovery within this window lets the SSH
+    // stream continue uninterrupted. Sustained loss (NAT mapping gone, etc.)
+    // expires the grace and tears down fast instead of hanging for minutes.
+    const DISCONNECT_GRACE: Duration = Duration::from_secs(15);
+
     let pc_monitor = peer_connection.clone();
     let webrtc_dead = tokio_util::sync::CancellationToken::new();
     let webrtc_dead_tx = webrtc_dead.clone();
     tokio::spawn(async move {
         let mut state_rx = pc_monitor.subscribe_peer_state();
-        while let Ok(()) = state_rx.changed().await {
+        loop {
+            if state_rx.changed().await.is_err() {
+                return;
+            }
             let state = *state_rx.borrow();
             match state {
-                rustrtc::PeerConnectionState::Disconnected
-                | rustrtc::PeerConnectionState::Failed
+                rustrtc::PeerConnectionState::Failed
                 | rustrtc::PeerConnectionState::Closed => {
                     if let Some(reason) = pc_monitor.disconnect_reason() {
                         tracing::warn!("WebRTC connection lost: {} (state: {:?})", reason, state);
@@ -81,7 +90,66 @@ where
                         tracing::warn!("WebRTC connection lost: state {:?}", state);
                     }
                     webrtc_dead_tx.cancel();
-                    break;
+                    return;
+                }
+                rustrtc::PeerConnectionState::Disconnected => {
+                    tracing::warn!(
+                        "WebRTC disconnected; waiting up to {:?} for recovery",
+                        DISCONNECT_GRACE
+                    );
+                    let deadline = tokio::time::Instant::now() + DISCONNECT_GRACE;
+                    let mut recovered = false;
+                    loop {
+                        tokio::select! {
+                            changed = state_rx.changed() => {
+                                if changed.is_err() {
+                                    break;
+                                }
+                                match *state_rx.borrow() {
+                                    rustrtc::PeerConnectionState::Connected => {
+                                        recovered = true;
+                                        break;
+                                    }
+                                    rustrtc::PeerConnectionState::Failed
+                                    | rustrtc::PeerConnectionState::Closed => {
+                                        if let Some(reason) = pc_monitor.disconnect_reason() {
+                                            tracing::warn!(
+                                                "WebRTC connection lost during grace: {}",
+                                                reason
+                                            );
+                                        } else {
+                                            tracing::warn!("WebRTC connection lost during grace");
+                                        }
+                                        webrtc_dead_tx.cancel();
+                                        return;
+                                    }
+                                    _ => {} // still disconnected, keep waiting
+                                }
+                            }
+                            _ = tokio::time::sleep_until(deadline) => {
+                                break; // grace expired
+                            }
+                        }
+                    }
+                    if recovered {
+                        tracing::info!("WebRTC recovered after disconnect, resuming");
+                        // continue monitoring
+                    } else {
+                        if let Some(reason) = pc_monitor.disconnect_reason() {
+                            tracing::warn!(
+                                "WebRTC did not recover within {:?}, giving up: {}",
+                                DISCONNECT_GRACE,
+                                reason
+                            );
+                        } else {
+                            tracing::warn!(
+                                "WebRTC did not recover within {:?}, giving up",
+                                DISCONNECT_GRACE
+                            );
+                        }
+                        webrtc_dead_tx.cancel();
+                        return;
+                    }
                 }
                 _ => {}
             }
