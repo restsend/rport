@@ -1,9 +1,12 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 pub mod acl;
 mod agent;
 mod cli;
 mod client;
 mod config;
+mod daemon;
 mod dtls_signaling;
 mod known_hosts;
 mod webrtc_config;
@@ -19,6 +22,11 @@ use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    if cli.daemon {
+        let log_file = cli.log_file.clone().unwrap_or_else(|| PathBuf::from("rport.log"));
+        daemon::daemonize_with_log(&log_file)?;
+    }
 
     tokio::runtime::Runtime::new()?.block_on(async_main(cli))
 }

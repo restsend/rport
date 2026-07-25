@@ -40,4 +40,12 @@ pub struct Cli {
 
     #[arg(long = "upnp", default_value_t = false)]
     pub upnp: bool,
+
+    /// Daemonize the process (Unix only)
+    #[arg(short = 'd', long)]
+    pub daemon: bool,
+
+    /// Log file path (used with --daemon or config)
+    #[arg(long = "log-file")]
+    pub log_file: Option<PathBuf>,
 }
