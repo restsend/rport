@@ -387,7 +387,10 @@ impl CliClient {
 
         let session_id = Uuid::new_v4().to_string();
 
-        // Send offer immediately with whatever candidates have been gathered so far
+        // Wait for all ICE candidates before sending offer so that
+        // old HTTP/SSE agents (which ignore trickle ICE) get all candidates in the SDP
+        peer_connection.wait_for_gathering_complete().await;
+
         let offer_sdp = peer_connection.local_description()
             .ok_or_else(|| anyhow!("Failed to get local description"))?
             .to_sdp_string();
