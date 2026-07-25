@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use rustrtc::transports::dtls::{self, DtlsState, DtlsTransport, Certificate};
 use rustrtc::transports::ice::conn::IceConn;
@@ -6,6 +6,7 @@ use rustrtc::transports::ice::IceSocketWrapper;
 use rustrtc::transports::PacketReceiver;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::net::UdpSocket;
@@ -65,6 +66,22 @@ struct AgentSession {
 }
 
 pub struct DtlsHandler;
+
+pub fn load_certificate(cert_path: &Path, key_path: &Path) -> Result<Certificate> {
+    let cert_pem = std::fs::read_to_string(cert_path)
+        .with_context(|| format!("Failed to read DTLS cert from {}", cert_path.display()))?;
+    let key_pem = std::fs::read_to_string(key_path)
+        .with_context(|| format!("Failed to read DTLS key from {}", key_path.display()))?;
+
+    let pem_data = pem::parse(&cert_pem)
+        .with_context(|| format!("Failed to parse DTLS cert PEM from {}", cert_path.display()))?;
+    let der_bytes = pem_data.contents().to_vec();
+
+    let mut cert = Certificate::default();
+    cert.certificate = vec![der_bytes];
+    cert.private_key = key_pem;
+    Ok(cert)
+}
 
 impl DtlsHandler {
 

@@ -96,9 +96,10 @@ impl DtlsClient {
         addr: &str,
         expected_fingerprint: Option<String>,
     ) -> Result<Self> {
-        let remote_addr: SocketAddr = addr
-            .parse()
-            .map_err(|e| anyhow!("Invalid DTLS address '{}': {}", addr, e))?;
+        let remote_addr: SocketAddr = tokio::net::lookup_host(addr)
+            .await?
+            .next()
+            .ok_or_else(|| anyhow!("Could not resolve DTLS address '{}'", addr))?;
 
         let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         debug!("DTLS client bound {}, connecting to {}", socket.local_addr()?, remote_addr);

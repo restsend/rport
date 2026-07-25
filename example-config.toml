@@ -8,6 +8,12 @@
 # 2. Configuration file
 # 3. Default values (lowest)
 
+# DTLS server address for agent mode
+# This is equivalent to the --dtls-server command line argument
+# The agent registers with this DTLS signaling server and waits for relayed offers
+# [dtls]
+# server = "ruzhila.cn:8443"
+
 # Authentication token (REQUIRED)
 # This token must match between client, agent, and server
 # Can be overridden with --token argument or environment variable

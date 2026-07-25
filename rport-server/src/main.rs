@@ -1,9 +1,11 @@
 use anyhow::Result;
 use clap::Parser;
 use cli::ServerCli;
+use dtls_handler::load_certificate;
 use rport_server::{handler::create_router, TurnServer};
 use std::{
     net::{IpAddr, SocketAddr},
+    path::Path,
     sync::Arc,
 };
 use tracing::info;
@@ -52,7 +54,13 @@ async fn main() -> anyhow::Result<()> {
     // Start DTLS signaling server (if configured)
     if let Some(dtls_addr) = &cli.dtls_addr {
         info!("Starting DTLS signaling server on {}", dtls_addr);
-        let _dtls_handle = dtls_handler::DtlsHandler::listen(dtls_addr.clone(), None).await?;
+        let cert = match (&cli.dtls_cert, &cli.dtls_key) {
+            (Some(cert_path), Some(key_path)) => {
+                Some(load_certificate(Path::new(cert_path), Path::new(key_path))?)
+            }
+            _ => None,
+        };
+        let _dtls_handle = dtls_handler::DtlsHandler::listen(dtls_addr.clone(), cert).await?;
     }
 
     // Start HTTP server

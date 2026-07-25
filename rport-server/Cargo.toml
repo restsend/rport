@@ -27,5 +27,6 @@ rustrtc = "0.3.99"
 async-stream = "0.3.6"
 tower-http = { version = "0.6.7", features = ["cors", "trace"] }
 clap = { version = "4.5.53", features = ["derive"] }
+pem = "3"
 bytes = "1"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
