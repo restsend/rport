@@ -304,14 +304,12 @@ async fn handle_offer(
                                             match tcp_read.read(&mut buf).await {
                                                 Ok(0) | Err(_) => break,
                                                 Ok(n) => {
-                                                    debug!("Agent forwarding {} bytes from TCP to WebRTC (dc_id={})", n, dc_id);
                                                     if pc3.send_data(dc_id, &buf[..n]).await.is_err() { break; }
                                                 }
                                             }
                                         }
                                     });
                                     while let Some(data) = rx.recv().await {
-                                        debug!("Agent writing {} bytes from WebRTC to TCP", data.len());
                                         if tcp_write.write_all(&data).await.is_err() { break; }
                                         let _ = tcp_write.flush().await;
                                     }
@@ -321,7 +319,6 @@ async fn handle_offer(
                         });
                     }
                     DataChannelEvent::Message(data) => {
-                        debug!("Agent DC received {} bytes (before TCP connect)", data.len());
                         let _ = tcp_msg_tx.send(Bytes::from(data));
                     }
                     DataChannelEvent::Close => {
