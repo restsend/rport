@@ -18,9 +18,32 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 pub const RECONNECT_INTERVAL: u64 = 5;
+
+/// Owns a WebRTC peer connection and all background tasks spawned for it.
+/// On drop, closes the PC (which unblocks tasks waiting on its channels)
+/// and aborts any tasks that are still alive.
+struct ActiveSession {
+    pc: Arc<PeerConnection>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl ActiveSession {
+    fn close(&mut self) {
+        self.pc.close();
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for ActiveSession {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
 
 pub struct Agent {
     server_url: String,
@@ -121,11 +144,11 @@ impl Agent {
         };
 
         let message_loop = async {
-            let mut active_session: Option<Arc<PeerConnection>> = None;
+            let mut active_session: Option<ActiveSession> = None;
 
             loop {
                 let msg = match tokio::time::timeout(
-                    Duration::from_secs(25),
+                    Duration::from_secs(45),
                     recv_message(&mut client.data_rx),
                 ).await {
                     Ok(Ok(m)) => m,
@@ -134,7 +157,7 @@ impl Agent {
                         break;
                     }
                     Err(_) => {
-                        warn!("DTLS recv timeout (25s)");
+                        warn!("DTLS recv timeout (45s)");
                         break;
                     }
                 };
@@ -146,15 +169,17 @@ impl Agent {
                         let wc = self.webrtc_config.clone();
                         let ac = self.acl.clone();
 
-                        // Drop previous session if any
-                        active_session.take();
+                        // Drop previous session (close PC + abort tasks)
+                        if let Some(mut session) = active_session.take() {
+                            session.close();
+                        }
 
                         match handle_offer(
                             dtls, &session_id, &offer_sdp, targets,
                             ac, wc, &extra_ice_servers,
                         ).await {
-                            Ok(pc) => {
-                                active_session = Some(pc);
+                            Ok(session) => {
+                                active_session = Some(session);
                             }
                             Err(e) => {
                                 error!("Failed to handle offer {}: {}", session_id, e);
@@ -162,9 +187,9 @@ impl Agent {
                         }
                     }
                     SignalingMessage::Candidate { candidate, .. } => {
-                        if let Some(ref pc) = active_session {
+                        if let Some(ref session) = active_session {
                             if let Ok(c) = IceCandidate::from_sdp(&candidate) {
-                                pc.add_ice_candidate(c).ok();
+                                session.pc.add_ice_candidate(c).ok();
                             }
                         }
                     }
@@ -176,6 +201,11 @@ impl Agent {
                     SignalingMessage::Error { reason, .. } => warn!("Server error: {}", reason),
                     other => warn!("Unexpected message from server: {:?}", other),
                 }
+            }
+
+            // Cleanup active session on exit
+            if let Some(mut session) = active_session.take() {
+                session.close();
             }
         };
 
@@ -196,7 +226,7 @@ async fn handle_offer(
     acl: Option<Acl>,
     webrtc_config: WebRTCConfig,
     extra_ice_servers: &[IceServerConfig],
-) -> Result<Arc<PeerConnection>> {
+) -> Result<ActiveSession> {
     // Resolve targets
     let targets: Vec<(String, u16)> = if let Some(tgts) = targets {
         tgts.iter().map(|t| {
@@ -236,6 +266,9 @@ async fn handle_offer(
     // Create WebRTC peer connection
     let peer_connection = webrtc_config.create_peer_connection_with(extra_ice_servers).await?;
 
+    // Tasks spawned for this session — tracked for cleanup
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     // Create data channels for each target
     struct FwdTarget {
         dc_label: String,
@@ -268,7 +301,7 @@ async fn handle_offer(
         let pc = peer_connection.clone();
         let h = host.clone();
 
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             let dc_id = dc.id;
             let (tcp_msg_tx, tcp_msg_rx) = mpsc::unbounded_channel::<Bytes>();
             let tcp_msg_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(tcp_msg_rx)));
@@ -327,73 +360,84 @@ async fn handle_offer(
                     }
                 }
             }
-        });
+        }));
     }
 
     // Drain PeerConnection events
-    let pc_drain = peer_connection.clone();
-    tokio::spawn(async move {
-        while let Some(_) = pc_drain.recv().await {}
-    });
+    {
+        let pc_drain = peer_connection.clone();
+        tasks.push(tokio::spawn(async move {
+            while let Some(_) = pc_drain.recv().await {}
+        }));
+    }
 
-    // Send answer immediately without waiting for full ICE gathering
-    let answer = peer_connection.create_answer().await?;
-    peer_connection.set_local_description(answer)?;
+    // Send answer — if this fails, clean up spawned tasks
+    let answer_result: Result<(), anyhow::Error> = async {
+        let answer = peer_connection.create_answer().await?;
+        peer_connection.set_local_description(answer)?;
+        let answer_sdp = peer_connection.local_description()
+            .ok_or_else(|| anyhow!("No local description"))?
+            .to_sdp_string();
+        send_message(&dtls, &SignalingMessage::Answer {
+            session_id: session_id.to_string(),
+            answer_sdp,
+        }).await?;
+        Ok(())
+    }.await;
 
-    let answer_sdp = peer_connection.local_description()
-        .ok_or_else(|| anyhow!("No local description"))?
-        .to_sdp_string();
-
-    send_message(&dtls, &SignalingMessage::Answer {
-        session_id: session_id.to_string(),
-        answer_sdp,
-    }).await?;
+    if let Err(e) = answer_result {
+        for t in &tasks { t.abort(); }
+        peer_connection.close();
+        return Err(e);
+    }
 
     info!("WebRTC answer sent for session {}", session_id);
 
     // Trickle ICE: forward gathered candidates as they arrive
-    let mut candidate_rx = peer_connection.subscribe_ice_candidates();
-    let mut gathering_state_rx = peer_connection.subscribe_ice_gathering_state();
-    let dtls_c = dtls.clone();
-    let sid = session_id.to_string();
-    tokio::spawn(async move {
-        if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-            let _ = send_message(&dtls_c, &SignalingMessage::EndOfCandidates {
-                session_id: sid.clone(),
-            }).await;
-            return;
-        }
-        loop {
-            tokio::select! {
-                result = candidate_rx.recv() => {
-                    match result {
-                        Ok(candidate) => {
-                            let _ = send_message(&dtls_c, &SignalingMessage::Candidate {
-                                session_id: sid.clone(),
-                                candidate: candidate.to_sdp(),
-                            }).await;
-                            if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                                let _ = send_message(&dtls_c, &SignalingMessage::EndOfCandidates {
+    {
+        let mut candidate_rx = peer_connection.subscribe_ice_candidates();
+        let mut gathering_state_rx = peer_connection.subscribe_ice_gathering_state();
+        let dtls_c = dtls.clone();
+        let sid = session_id.to_string();
+        tasks.push(tokio::spawn(async move {
+            if *gathering_state_rx.borrow() == IceGatheringState::Complete {
+                let _ = send_message(&dtls_c, &SignalingMessage::EndOfCandidates {
+                    session_id: sid.clone(),
+                }).await;
+                return;
+            }
+            loop {
+                tokio::select! {
+                    result = candidate_rx.recv() => {
+                        match result {
+                            Ok(candidate) => {
+                                let _ = send_message(&dtls_c, &SignalingMessage::Candidate {
                                     session_id: sid.clone(),
+                                    candidate: candidate.to_sdp(),
                                 }).await;
-                                break;
+                                if *gathering_state_rx.borrow() == IceGatheringState::Complete {
+                                    let _ = send_message(&dtls_c, &SignalingMessage::EndOfCandidates {
+                                        session_id: sid.clone(),
+                                    }).await;
+                                    break;
+                                }
                             }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
-                }
-                _ = gathering_state_rx.changed() => {
-                    if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                        let _ = send_message(&dtls_c, &SignalingMessage::EndOfCandidates {
-                            session_id: sid.clone(),
-                        }).await;
-                        break;
+                    _ = gathering_state_rx.changed() => {
+                        if *gathering_state_rx.borrow() == IceGatheringState::Complete {
+                            let _ = send_message(&dtls_c, &SignalingMessage::EndOfCandidates {
+                                session_id: sid.clone(),
+                            }).await;
+                            break;
+                        }
                     }
                 }
             }
-        }
-    });
+        }));
+    }
 
-    Ok(peer_connection)
+    Ok(ActiveSession { pc: peer_connection, tasks })
 }
