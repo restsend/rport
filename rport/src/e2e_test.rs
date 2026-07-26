@@ -226,22 +226,18 @@ async fn test_webrtc_e2e_data_flow() {
         let sid = session_id.clone();
         tokio::spawn(async move {
             if *state_rx.borrow() == IceGatheringState::Complete {
-                let _ = send_message(&dtls, &SignalingMessage::EndOfCandidates {
-                    session_id: sid.clone(),
-                }).await;
+                let _ = send_message(&dtls, &SignalingMessage::new_end_of_candidates(sid.clone())).await;
                 return;
             }
             loop {
                 tokio::select! {
                     result = candidate_rx.recv() => match result {
                         Ok(c) => {
-                            send_message(&dtls, &SignalingMessage::Candidate {
-                                session_id: sid.clone(), candidate: c.to_sdp(),
-                            }).await.ok();
+                            send_message(&dtls, &SignalingMessage::new_candidate(
+                                sid.clone(), c.to_sdp(),
+                            )).await.ok();
                             if *state_rx.borrow() == IceGatheringState::Complete {
-                                send_message(&dtls, &SignalingMessage::EndOfCandidates {
-                                    session_id: sid.clone(),
-                                }).await.ok();
+                                send_message(&dtls, &SignalingMessage::new_end_of_candidates(sid.clone())).await.ok();
                                 break;
                             }
                         }
@@ -250,9 +246,7 @@ async fn test_webrtc_e2e_data_flow() {
                     },
                     _ = state_rx.changed() => {
                         if *state_rx.borrow() == IceGatheringState::Complete {
-                            send_message(&dtls, &SignalingMessage::EndOfCandidates {
-                                session_id: sid.clone(),
-                            }).await.ok();
+                            send_message(&dtls, &SignalingMessage::new_end_of_candidates(sid.clone())).await.ok();
                             break;
                         }
                     }
@@ -268,22 +262,18 @@ async fn test_webrtc_e2e_data_flow() {
         let sid = session_id.clone();
         tokio::spawn(async move {
             if *state_rx.borrow() == IceGatheringState::Complete {
-                let _ = send_message(&dtls, &SignalingMessage::EndOfCandidates {
-                    session_id: sid.clone(),
-                }).await;
+                let _ = send_message(&dtls, &SignalingMessage::new_end_of_candidates(sid.clone())).await;
                 return;
             }
             loop {
                 tokio::select! {
                     result = candidate_rx.recv() => match result {
                         Ok(c) => {
-                            send_message(&dtls, &SignalingMessage::Candidate {
-                                session_id: sid.clone(), candidate: c.to_sdp(),
-                            }).await.ok();
+                            send_message(&dtls, &SignalingMessage::new_candidate(
+                                sid.clone(), c.to_sdp(),
+                            )).await.ok();
                             if *state_rx.borrow() == IceGatheringState::Complete {
-                                send_message(&dtls, &SignalingMessage::EndOfCandidates {
-                                    session_id: sid.clone(),
-                                }).await.ok();
+                                send_message(&dtls, &SignalingMessage::new_end_of_candidates(sid.clone())).await.ok();
                                 break;
                             }
                         }
@@ -292,9 +282,7 @@ async fn test_webrtc_e2e_data_flow() {
                     },
                     _ = state_rx.changed() => {
                         if *state_rx.borrow() == IceGatheringState::Complete {
-                            send_message(&dtls, &SignalingMessage::EndOfCandidates {
-                                session_id: sid.clone(),
-                            }).await.ok();
+                            send_message(&dtls, &SignalingMessage::new_end_of_candidates(sid.clone())).await.ok();
                             break;
                         }
                     }
@@ -328,10 +316,10 @@ async fn test_webrtc_e2e_data_flow() {
                         let answer = pc.create_answer().await.unwrap();
                         pc.set_local_description(answer).unwrap();
                         let answer_sdp = pc.local_description().unwrap().to_sdp_string();
-                        send_message(&dtls_tx, &SignalingMessage::Answer {
-                            session_id: sid.clone(),
+                        send_message(&dtls_tx, &SignalingMessage::new_answer(
+                            sid.clone(),
                             answer_sdp,
-                        }).await.unwrap();
+                        )).await.unwrap();
                         tracing::info!("Agent sent answer");
                     }
                     SignalingMessage::Candidate { candidate, .. } => {
@@ -353,15 +341,15 @@ async fn test_webrtc_e2e_data_flow() {
 
     send_message(
         &client_dtls.dtls,
-        &SignalingMessage::Offer {
-            session_id: session_id.clone(),
-            agent_id: "test-agent".to_string(),
+        &SignalingMessage::new_offer(
+            session_id.clone(),
+            "test-agent".to_string(),
             offer_sdp,
-            targets: Some(vec![Target {
+            Some(vec![Target {
                 host: Some("127.0.0.1".to_string()),
                 port: echo_addr.port(),
             }]),
-        },
+        ),
     )
     .await
     .unwrap();

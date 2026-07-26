@@ -533,15 +533,15 @@ impl CliClient {
             .to_sdp_string();
 
         info!("Sending offer for agent '{}' session {}", self.agent_id, session_id);
-        dtls_client.send(&SignalingMessage::Offer {
-            session_id: session_id.clone(),
-            agent_id: self.agent_id.clone(),
+        dtls_client.send(&SignalingMessage::new_offer(
+            session_id.clone(),
+            self.agent_id.clone(),
             offer_sdp,
-            targets: Some(vec![Target {
+            Some(vec![Target {
                 host: Some(target_host.to_string()),
                 port: target_port,
             }]),
-        }).await?;
+        )).await?;
 
         // Trickle ICE: forward gathered candidates as they arrive
         let mut candidate_rx = peer_connection.subscribe_ice_candidates();
@@ -550,9 +550,7 @@ impl CliClient {
         let sid = session_id.clone();
         tokio::spawn(async move {
             if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                let _ = send_message(&dtls, &SignalingMessage::EndOfCandidates {
-                    session_id: sid.clone(),
-                }).await;
+                let _ = send_message(&dtls, &SignalingMessage::new_end_of_candidates(sid.clone())).await;
                 return;
             }
             loop {
@@ -564,14 +562,12 @@ impl CliClient {
                                     "Local ICE candidate: {} {} {} {:?}",
                                     candidate.address, candidate.transport, candidate.priority, candidate.typ,
                                 );
-                                let _ = send_message(&dtls, &SignalingMessage::Candidate {
-                                    session_id: sid.clone(),
-                                    candidate: candidate.to_sdp(),
-                                }).await;
+                                let _ = send_message(&dtls, &SignalingMessage::new_candidate(
+                                    sid.clone(),
+                                    candidate.to_sdp(),
+                                )).await;
                                 if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                                    let _ = send_message(&dtls, &SignalingMessage::EndOfCandidates {
-                                        session_id: sid.clone(),
-                                    }).await;
+                                    let _ = send_message(&dtls, &SignalingMessage::new_end_of_candidates(sid.clone())).await;
                                     break;
                                 }
                             }
@@ -581,9 +577,7 @@ impl CliClient {
                     }
                     _ = gathering_state_rx.changed() => {
                         if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                            let _ = send_message(&dtls, &SignalingMessage::EndOfCandidates {
-                                session_id: sid.clone(),
-                            }).await;
+                            let _ = send_message(&dtls, &SignalingMessage::new_end_of_candidates(sid.clone())).await;
                             break;
                         }
                     }
@@ -617,6 +611,7 @@ impl CliClient {
         // eventually connect.
         let mut pc_state_rx = peer_connection.subscribe_peer_state();
         let mut answer_received = false;
+        let mut received_end_of_candidates = false;
 
         loop {
             tokio::select! {
@@ -651,6 +646,7 @@ impl CliClient {
                             if answer_received {
                                 break;
                             }
+                            received_end_of_candidates = true;
                         }
                         SignalingMessage::Error { reason, .. } => {
                             dtls_client.close();
@@ -660,6 +656,9 @@ impl CliClient {
                             debug!("Unexpected message during signaling: {:?}", other);
                             continue;
                         }
+                    }
+                    if answer_received && received_end_of_candidates {
+                        break;
                     }
                 }
                 // ICE has connected — data channel is about to open
@@ -688,6 +687,9 @@ impl CliClient {
                     if answer_received {
                         warn!("Timeout waiting for ICE to connect, proceeding");
                         break;
+                    }
+                    if received_end_of_candidates {
+                        return Err(anyhow!("Timeout waiting for answer from agent"));
                     }
                 }
             }

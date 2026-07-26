@@ -32,23 +32,68 @@ pub enum SignalingMessage {
     #[serde(rename = "register")]
     Register { token: String, id: String },
     #[serde(rename = "offer")]
-    Offer { session_id: String, agent_id: String, offer_sdp: String, targets: Option<Vec<Target>> },
+    Offer {
+        session_id: String,
+        agent_id: String,
+        offer_sdp: String,
+        targets: Option<Vec<Target>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<u64>,
+    },
     #[serde(rename = "answer")]
-    Answer { session_id: String, answer_sdp: String },
+    Answer {
+        session_id: String,
+        answer_sdp: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<u64>,
+    },
     #[serde(rename = "candidate")]
-    Candidate { session_id: String, candidate: String },
+    Candidate {
+        session_id: String,
+        candidate: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<u64>,
+    },
     #[serde(rename = "end-of-candidates")]
-    EndOfCandidates { session_id: String },
+    EndOfCandidates {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<u64>,
+    },
     #[serde(rename = "ice-servers")]
     IceServers { ice_servers: Vec<IceServerInfo> },
     #[serde(rename = "get-ice-servers")]
     GetIceServers,
     #[serde(rename = "error")]
-    Error { session_id: String, reason: String },
+    Error {
+        session_id: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<u64>,
+    },
     #[serde(rename = "ping")]
     Ping,
     #[serde(rename = "pong")]
     Pong,
+    #[serde(rename = "ack")]
+    Ack {
+        session_id: String,
+        ack_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<u64>,
+    },
 }
 
 //=== Frame codec ===
@@ -72,6 +117,27 @@ pub async fn recv_message(rx: &mut mpsc::UnboundedReceiver<Bytes>) -> Result<Sig
         return Err(anyhow!("Incomplete frame"));
     }
     Ok(serde_json::from_slice(&data[4..4 + msg_len])?)
+}
+
+impl SignalingMessage {
+    pub fn new_offer(session_id: String, agent_id: String, offer_sdp: String, targets: Option<Vec<Target>>) -> Self {
+        Self::Offer { session_id, agent_id, offer_sdp, targets, seq: None, ack: None }
+    }
+    pub fn new_answer(session_id: String, answer_sdp: String) -> Self {
+        Self::Answer { session_id, answer_sdp, seq: None, ack: None }
+    }
+    pub fn new_candidate(session_id: String, candidate: String) -> Self {
+        Self::Candidate { session_id, candidate, seq: None, ack: None }
+    }
+    pub fn new_end_of_candidates(session_id: String) -> Self {
+        Self::EndOfCandidates { session_id, seq: None, ack: None }
+    }
+    pub fn new_error(session_id: String, reason: String) -> Self {
+        Self::Error { session_id, reason, seq: None, ack: None }
+    }
+    pub fn new_ack(session_id: String, ack_seq: u64) -> Self {
+        Self::Ack { session_id, ack_seq, seq: None, ack: None }
+    }
 }
 
 pub async fn send_message(dtls: &DtlsTransport, msg: &SignalingMessage) -> Result<()> {
@@ -305,12 +371,12 @@ mod tests {
         let mut agent_session = agent.accept().await.expect("Agent should accept connection");
 
         let session_id = "test-session-1".to_string();
-        client.send(&SignalingMessage::Offer {
-            session_id: session_id.clone(),
-            agent_id: "test-agent".to_string(),
-            offer_sdp: "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n".to_string(),
-            targets: Some(vec![Target { host: Some("127.0.0.1".to_string()), port: 22 }]),
-        }).await.unwrap();
+        client.send(&SignalingMessage::new_offer(
+            session_id.clone(),
+            "test-agent".to_string(),
+            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n".to_string(),
+            Some(vec![Target { host: Some("127.0.0.1".to_string()), port: 22 }]),
+        )).await.unwrap();
 
         let msg = tokio::time::timeout(Duration::from_secs(5), recv_message(&mut agent_session.data_rx)).await
             .expect("Timeout receiving offer").unwrap();
@@ -326,15 +392,15 @@ mod tests {
             other => panic!("Expected offer, got {:?}", other),
         }
 
-        send_message(&agent_session.dtls, &SignalingMessage::Answer {
-            session_id: session_id.clone(),
-            answer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n".to_string(),
-        }).await.unwrap();
+        send_message(&agent_session.dtls, &SignalingMessage::new_answer(
+            session_id.clone(),
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n".to_string(),
+        )).await.unwrap();
 
         let msg = tokio::time::timeout(Duration::from_secs(5), client.recv()).await
             .expect("Timeout receiving answer").unwrap();
         match msg {
-            SignalingMessage::Answer { session_id: sid, answer_sdp } => {
+            SignalingMessage::Answer { session_id: sid, answer_sdp, .. } => {
                 assert_eq!(sid, "test-session-1");
                 assert!(answer_sdp.contains("v=0"));
             }

@@ -39,23 +39,89 @@ pub enum SignalingMessage {
     #[serde(rename = "register")]
     Register { token: String, id: String },
     #[serde(rename = "offer")]
-    Offer { session_id: String, agent_id: String, offer_sdp: String, targets: Option<Vec<Target>> },
+    Offer {
+        session_id: String,
+        agent_id: String,
+        offer_sdp: String,
+        targets: Option<Vec<Target>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<u64>,
+    },
     #[serde(rename = "answer")]
-    Answer { session_id: String, answer_sdp: String },
+    Answer {
+        session_id: String,
+        answer_sdp: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<u64>,
+    },
     #[serde(rename = "candidate")]
-    Candidate { session_id: String, candidate: String },
+    Candidate {
+        session_id: String,
+        candidate: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<u64>,
+    },
     #[serde(rename = "end-of-candidates")]
-    EndOfCandidates { session_id: String },
+    EndOfCandidates {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<u64>,
+    },
     #[serde(rename = "ice-servers")]
     IceServers { ice_servers: Vec<IceServerInfo> },
     #[serde(rename = "get-ice-servers")]
     GetIceServers,
     #[serde(rename = "error")]
-    Error { session_id: String, reason: String },
+    Error {
+        session_id: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<u64>,
+    },
     #[serde(rename = "ping")]
     Ping,
     #[serde(rename = "pong")]
     Pong,
+    #[serde(rename = "ack")]
+    Ack {
+        session_id: String,
+        ack_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<u64>,
+    },
+}
+
+impl SignalingMessage {
+    pub fn new_offer(session_id: String, agent_id: String, offer_sdp: String, targets: Option<Vec<Target>>) -> Self {
+        Self::Offer { session_id, agent_id, offer_sdp, targets, seq: None, ack: None }
+    }
+    pub fn new_answer(session_id: String, answer_sdp: String) -> Self {
+        Self::Answer { session_id, answer_sdp, seq: None, ack: None }
+    }
+    pub fn new_candidate(session_id: String, candidate: String) -> Self {
+        Self::Candidate { session_id, candidate, seq: None, ack: None }
+    }
+    pub fn new_end_of_candidates(session_id: String) -> Self {
+        Self::EndOfCandidates { session_id, seq: None, ack: None }
+    }
+    pub fn new_error(session_id: String, reason: String) -> Self {
+        Self::Error { session_id, reason, seq: None, ack: None }
+    }
+    pub fn new_ack(session_id: String, ack_seq: u64) -> Self {
+        Self::Ack { session_id, ack_seq, seq: None, ack: None }
+    }
 }
 
 fn encode_msg(msg: &SignalingMessage) -> Result<Vec<u8>> {
@@ -301,7 +367,7 @@ impl DtlsHandler {
                                       id, start.elapsed().as_secs_f64(), count,
                                       if superseded { " (superseded by newer connection)" } else { "" });
                             }
-                            SignalingMessage::Offer { session_id, agent_id, offer_sdp, targets } => {
+                            SignalingMessage::Offer { session_id, agent_id, offer_sdp, targets, .. } => {
                                 info!("Offer from client for agent '{}' (session: {}) from {}", agent_id, session_id, addr);
                                 let sid = session_id.clone();
                                 let aid = agent_id.clone();
@@ -314,18 +380,18 @@ impl DtlsHandler {
                                 if let Some(agent_dtls) = agent_dtls {
                                     info!("Agent '{}' found via DTLS registry", agent_id);
 
-                                    let offer_msg = SignalingMessage::Offer {
-                                        session_id: session_id.clone(),
-                                        agent_id: agent_id.clone(),
+                                    let offer_msg = SignalingMessage::new_offer(
+                                        session_id.clone(),
+                                        agent_id.clone(),
                                         offer_sdp,
                                         targets,
-                                    };
+                                    );
                                     if let Err(e) = send_msg(&agent_dtls, &offer_msg).await {
                                         warn!("Failed to forward offer to agent '{}': {}", agent_id, e);
-                                        let _ = send_msg(&dtls_c, &SignalingMessage::Error {
+                                        let _ = send_msg(&dtls_c, &SignalingMessage::new_error(
                                             session_id,
-                                            reason: format!("Agent '{}' unavailable", agent_id),
-                                        }).await;
+                                            format!("Agent '{}' unavailable", agent_id),
+                                        )).await;
                                         sessions_c.write().await.remove(&sid);
                                         return;
                                     }
@@ -353,19 +419,19 @@ impl DtlsHandler {
                                         warn!("Failed to send offer via SSE to agent '{}'", agent_id);
                                         state_c.pending_offers.write().await.remove(&uuid);
                                         state_c.pending_candidates.write().await.remove(&uuid);
-                                        let _ = send_msg(&dtls_c, &SignalingMessage::Error {
-                                            session_id: session_id.clone(),
-                                            reason: format!("Agent '{}' unavailable", agent_id),
-                                        }).await;
+                                        let _ = send_msg(&dtls_c, &SignalingMessage::new_error(
+                                            session_id.clone(),
+                                            format!("Agent '{}' unavailable", agent_id),
+                                        )).await;
                                         sessions_c.write().await.remove(&sid);
                                         return;
                                     }
                                     match tokio::time::timeout(Duration::from_secs(30), answer_rx).await {
                                         Ok(Ok(answer)) => {
-                                            let _ = send_msg(&dtls_c, &SignalingMessage::Answer {
-                                                session_id: session_id.clone(),
-                                                answer_sdp: answer,
-                                            }).await;
+                                            let _ = send_msg(&dtls_c, &SignalingMessage::new_answer(
+                                                session_id.clone(),
+                                                answer,
+                                            )).await;
                                             info!("Offer/answer bridge complete for agent '{}'", agent_id);
                                             Self::client_loop_bridge(dtls_c, &mut data_rx, state_c, sid.clone(), aid, uuid, candidate_rx).await;
                                             sessions_c.write().await.remove(&sid);
@@ -374,19 +440,19 @@ impl DtlsHandler {
                                             warn!("Answer timeout for bridged agent '{}'", agent_id);
                                             state_c.pending_offers.write().await.remove(&uuid);
                                             state_c.pending_candidates.write().await.remove(&uuid);
-                                            let _ = send_msg(&dtls_c, &SignalingMessage::Error {
-                                                session_id: session_id.clone(),
-                                                reason: format!("Agent '{}' answer timeout", agent_id),
-                                            }).await;
+                                            let _ = send_msg(&dtls_c, &SignalingMessage::new_error(
+                                                session_id.clone(),
+                                                format!("Agent '{}' answer timeout", agent_id),
+                                            )).await;
                                             sessions_c.write().await.remove(&sid);
                                         }
                                     }
                                 } else {
                                     warn!("Agent '{}' not found in any registry for session {}", agent_id, session_id);
-                                    let _ = send_msg(&dtls_c, &SignalingMessage::Error {
+                                    let _ = send_msg(&dtls_c, &SignalingMessage::new_error(
                                         session_id,
-                                        reason: format!("Agent '{}' not found", agent_id),
-                                    }).await;
+                                        format!("Agent '{}' not found", agent_id),
+                                    )).await;
                                     sessions_c.write().await.remove(&sid);
                                 }
                             }
@@ -440,29 +506,37 @@ impl DtlsHandler {
             };
 
             match msg {
-                SignalingMessage::Answer { session_id, answer_sdp } => {
+                SignalingMessage::Answer { session_id, answer_sdp, seq, ack } => {
                     let client = sessions.read().await.get(&session_id).cloned();
                     if let Some(client) = client {
                         if let Err(e) = send_msg(&client.dtls, &SignalingMessage::Answer {
-                            session_id, answer_sdp,
+                            session_id, answer_sdp, seq, ack,
                         }).await {
                             warn!("Failed to forward answer to client: {}", e);
                         }
                     }
                 }
-                SignalingMessage::Candidate { session_id, candidate } => {
+                SignalingMessage::Candidate { session_id, candidate, seq, ack } => {
                     let client = sessions.read().await.get(&session_id).cloned();
                     if let Some(client) = client {
                         let _ = send_msg(&client.dtls, &SignalingMessage::Candidate {
-                            session_id, candidate,
+                            session_id, candidate, seq, ack,
                         }).await;
                     }
                 }
-                SignalingMessage::EndOfCandidates { session_id } => {
+                SignalingMessage::EndOfCandidates { session_id, seq, ack } => {
                     let client = sessions.read().await.get(&session_id).cloned();
                     if let Some(client) = client {
                         let _ = send_msg(&client.dtls, &SignalingMessage::EndOfCandidates {
-                            session_id,
+                            session_id, seq, ack,
+                        }).await;
+                    }
+                }
+                SignalingMessage::Ack { session_id, ack_seq, seq, ack } => {
+                    let client = sessions.read().await.get(&session_id).cloned();
+                    if let Some(client) = client {
+                        let _ = send_msg(&client.dtls, &SignalingMessage::Ack {
+                            session_id, ack_seq, seq, ack,
                         }).await;
                     }
                 }
@@ -522,17 +596,24 @@ impl DtlsHandler {
             };
 
             match msg {
-                SignalingMessage::Candidate { session_id: sid, candidate } => {
+                SignalingMessage::Candidate { session_id: sid, candidate, seq, ack } => {
                     if let Some(agent_dtls) = agents.read().await.get(&agent_id) {
                         let _ = send_msg(agent_dtls, &SignalingMessage::Candidate {
-                            session_id: sid, candidate,
+                            session_id: sid, candidate, seq, ack,
                         }).await;
                     }
                 }
-                SignalingMessage::EndOfCandidates { session_id: sid } => {
+                SignalingMessage::EndOfCandidates { session_id: sid, seq, ack } => {
                     if let Some(agent_dtls) = agents.read().await.get(&agent_id) {
                         let _ = send_msg(agent_dtls, &SignalingMessage::EndOfCandidates {
-                            session_id: sid,
+                            session_id: sid, seq, ack,
+                        }).await;
+                    }
+                }
+                SignalingMessage::Ack { session_id: sid, ack_seq, seq, ack } => {
+                    if let Some(agent_dtls) = agents.read().await.get(&agent_id) {
+                        let _ = send_msg(agent_dtls, &SignalingMessage::Ack {
+                            session_id: sid, ack_seq, seq, ack,
                         }).await;
                     }
                 }
@@ -583,23 +664,43 @@ impl DtlsHandler {
             tokio::select! {
                 msg = recv_msg(data_rx) => {
                     match msg {
-                        Ok(SignalingMessage::Candidate { session_id: sid, candidate }) => {
+                        Ok(SignalingMessage::Candidate { session_id: sid, candidate, seq, ack }) => {
                             if let Some(ref agent) = http_agent {
                                 let msg = ServerMessage {
                                     message_type: "candidate".to_string(),
                                     data: serde_json::json!({
                                         "session_id": sid,
                                         "candidate": candidate,
+                                        "seq": seq,
+                                        "ack": ack,
                                     }),
                                 };
                                 let _ = agent.sender.send(msg);
                             }
                         }
-                        Ok(SignalingMessage::EndOfCandidates { session_id: sid }) => {
+                        Ok(SignalingMessage::EndOfCandidates { session_id: sid, seq, ack }) => {
                             if let Some(ref agent) = http_agent {
                                 let msg = ServerMessage {
                                     message_type: "end-of-candidates".to_string(),
-                                    data: serde_json::json!({"session_id": sid}),
+                                    data: serde_json::json!({
+                                        "session_id": sid,
+                                        "seq": seq,
+                                        "ack": ack,
+                                    }),
+                                };
+                                let _ = agent.sender.send(msg);
+                            }
+                        }
+                        Ok(SignalingMessage::Ack { session_id: sid, ack_seq, seq, ack }) => {
+                            if let Some(ref agent) = http_agent {
+                                let msg = ServerMessage {
+                                    message_type: "ack".to_string(),
+                                    data: serde_json::json!({
+                                        "session_id": sid,
+                                        "ack_seq": ack_seq,
+                                        "seq": seq,
+                                        "ack": ack,
+                                    }),
                                 };
                                 let _ = agent.sender.send(msg);
                             }
@@ -622,6 +723,8 @@ impl DtlsHandler {
                             let _ = send_msg(&dtls, &SignalingMessage::Candidate {
                                 session_id: session_id.clone(),
                                 candidate,
+                                seq: None,
+                                ack: None,
                             }).await;
                         }
                         None => break,

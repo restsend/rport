@@ -9,6 +9,7 @@ mod config;
 mod daemon;
 mod dtls_signaling;
 mod known_hosts;
+mod reliable;
 mod webrtc_config;
 
 #[cfg(test)]

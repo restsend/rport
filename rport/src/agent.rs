@@ -2,6 +2,7 @@ use crate::{
     acl::Acl,
     config::{IceServerConfig, RportConfig},
     dtls_signaling::{DtlsClient, SignalingMessage, Target, send_message, recv_message},
+    reliable::ReliableSession,
     webrtc_config::WebRTCConfig,
 };
 use anyhow::{anyhow, Result};
@@ -15,8 +16,8 @@ use rustrtc::{
     SessionDescription,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -30,6 +31,7 @@ pub const RECONNECT_INTERVAL: u64 = 5;
 struct ActiveSession {
     pc: Arc<PeerConnection>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    reliable: Arc<Mutex<ReliableSession>>,
 }
 
 impl ActiveSession {
@@ -212,17 +214,26 @@ impl Agent {
                             }
                         }
                     }
-                    SignalingMessage::Candidate { session_id, candidate, .. } => {
-                        if let Some(session) = active_sessions.get(&session_id) {
-                            if let Ok(c) = IceCandidate::from_sdp(&candidate) {
+                    SignalingMessage::Candidate { ref session_id, ref candidate, .. } => {
+                        if let Some(session) = active_sessions.get(session_id) {
+                            if let Ok(c) = IceCandidate::from_sdp(candidate) {
                                 session.pc.add_ice_candidate(c).ok();
                             }
+                            session.reliable.lock().unwrap().process_recv(&msg);
                         } else {
                             debug!("Candidate for unknown session {}, ignoring", session_id);
                         }
                     }
-                    SignalingMessage::EndOfCandidates { session_id } => {
+                    SignalingMessage::EndOfCandidates { ref session_id, .. } => {
+                        if let Some(session) = active_sessions.get(session_id) {
+                            session.reliable.lock().unwrap().process_recv(&msg);
+                        }
                         debug!("End-of-candidates for session {}", session_id);
+                    }
+                    SignalingMessage::Ack { ref session_id, .. } => {
+                        if let Some(session) = active_sessions.get(session_id) {
+                            session.reliable.lock().unwrap().process_recv(&msg);
+                        }
                     }
                     SignalingMessage::Ping => {
                         send_message(&client.dtls, &SignalingMessage::Pong).await.ok();
@@ -278,18 +289,18 @@ async fn handle_offer(
                     "0.0.0.0".parse::<IpAddr>().unwrap()
                 }),
                 Err(_) => {
-                    send_message(&dtls, &SignalingMessage::Error {
-                        session_id: session_id.to_string(),
-                        reason: format!("Cannot resolve target: {}", host),
-                    }).await.ok();
+                    send_message(&dtls, &SignalingMessage::new_error(
+                        session_id.to_string(),
+                        format!("Cannot resolve target: {}", host),
+                    )).await.ok();
                     return Err(anyhow!("Cannot resolve target: {}", host));
                 }
             };
             if !acl.is_allowed(&ip, *port) {
-                send_message(&dtls, &SignalingMessage::Error {
-                    session_id: session_id.to_string(),
-                    reason: format!("Access denied: {}:{}", host, port),
-                }).await.ok();
+                send_message(&dtls, &SignalingMessage::new_error(
+                    session_id.to_string(),
+                    format!("Access denied: {}:{}", host, port),
+                )).await.ok();
                 return Err(anyhow!("ACL denied: {}:{}", host, port));
             }
         }
@@ -454,17 +465,28 @@ async fn handle_offer(
         }));
     }
 
-    // Send answer — if this fails, clean up spawned tasks
+    // Reliable session for Answer retransmission
+    let reliable = Arc::new(Mutex::new(ReliableSession::new(
+        Duration::from_millis(2000),
+        3,
+    )));
+
+    // Send answer with seq=1 for retransmission tracking
     let answer_result: Result<(), anyhow::Error> = async {
         let answer = peer_connection.create_answer().await?;
         peer_connection.set_local_description(answer)?;
         let answer_sdp = peer_connection.local_description()
             .ok_or_else(|| anyhow!("No local description"))?
             .to_sdp_string();
-        send_message(&dtls, &SignalingMessage::Answer {
-            session_id: session_id.to_string(),
+        let mut msg = SignalingMessage::new_answer(
+            session_id.to_string(),
             answer_sdp,
-        }).await?;
+        );
+        {
+            let mut r = reliable.lock().unwrap();
+            r.prepare_send(&mut msg, true);
+        }
+        send_message(&dtls, &msg).await?;
         Ok(())
     }.await;
 
@@ -474,7 +496,33 @@ async fn handle_offer(
         return Err(e);
     }
 
-    info!("WebRTC answer sent for session {}", session_id);
+    info!("WebRTC answer sent for session {} (with reliability)", session_id);
+
+    // Retransmission timer for Answer/EndOfCandidates
+    {
+        let dtls_c = dtls.clone();
+        let rel = reliable.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                let pending = {
+                    let mut r = rel.lock().unwrap();
+                    r.due_retransmits(Instant::now())
+                };
+                if pending.is_empty() {
+                    if rel.lock().unwrap().is_exhausted() {
+                        break;
+                    }
+                    continue;
+                }
+                for p in pending {
+                    debug!("Retransmitting seq={}", p.seq);
+                    let _ = send_message(&dtls_c, &p.msg).await;
+                }
+            }
+        }));
+    }
 
     // Trickle ICE: forward gathered candidates as they arrive
     {
@@ -482,11 +530,15 @@ async fn handle_offer(
         let mut gathering_state_rx = peer_connection.subscribe_ice_gathering_state();
         let dtls_c = dtls.clone();
         let sid = session_id.to_string();
+        let rel = reliable.clone();
         tasks.push(tokio::spawn(async move {
             if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                let _ = send_message(&dtls_c, &SignalingMessage::EndOfCandidates {
-                    session_id: sid.clone(),
-                }).await;
+                let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());
+                {
+                    let mut r = rel.lock().unwrap();
+                    r.prepare_send(&mut msg, true);
+                }
+                let _ = send_message(&dtls_c, &msg).await;
                 return;
             }
             loop {
@@ -498,14 +550,22 @@ async fn handle_offer(
                                     "Local ICE candidate: {} {} {} {:?}",
                                     candidate.address, candidate.transport, candidate.priority, candidate.typ,
                                 );
-                                let _ = send_message(&dtls_c, &SignalingMessage::Candidate {
-                                    session_id: sid.clone(),
-                                    candidate: candidate.to_sdp(),
-                                }).await;
+                                let mut msg = SignalingMessage::new_candidate(
+                                    sid.clone(),
+                                    candidate.to_sdp(),
+                                );
+                                {
+                                    let mut r = rel.lock().unwrap();
+                                    r.prepare_send(&mut msg, false);
+                                }
+                                let _ = send_message(&dtls_c, &msg).await;
                                 if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                                    let _ = send_message(&dtls_c, &SignalingMessage::EndOfCandidates {
-                                        session_id: sid.clone(),
-                                    }).await;
+                                    let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());
+                                    {
+                                        let mut r = rel.lock().unwrap();
+                                        r.prepare_send(&mut msg, true);
+                                    }
+                                    let _ = send_message(&dtls_c, &msg).await;
                                     break;
                                 }
                             }
@@ -515,9 +575,12 @@ async fn handle_offer(
                     }
                     _ = gathering_state_rx.changed() => {
                         if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                            let _ = send_message(&dtls_c, &SignalingMessage::EndOfCandidates {
-                                session_id: sid.clone(),
-                            }).await;
+                            let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());
+                            {
+                                let mut r = rel.lock().unwrap();
+                                r.prepare_send(&mut msg, true);
+                            }
+                            let _ = send_message(&dtls_c, &msg).await;
                             break;
                         }
                     }
@@ -526,5 +589,5 @@ async fn handle_offer(
         }));
     }
 
-    Ok(ActiveSession { pc: peer_connection, tasks })
+    Ok(ActiveSession { pc: peer_connection, tasks, reliable })
 }

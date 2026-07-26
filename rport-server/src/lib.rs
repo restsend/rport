@@ -18,11 +18,19 @@ pub struct OfferMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnswerMessage {
     pub answer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateMessage {
     pub candidate: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
