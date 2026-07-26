@@ -352,44 +352,65 @@ impl CliClient {
         Ok(())
     }
 
+    /// Connect to DTLS, send GetIceServers, receive response.
+    /// Returns `Ok(Some((client, servers)))` on success.
+    /// Returns `Ok(None)` on timeout/old server — client is **dead**.
+    /// The caller should close it and reconnect without GetIceServers.
+    async fn connect_dtls_and_get_ice_servers(
+        server_url: &str,
+    ) -> Result<Option<(DtlsClient, Vec<IceServerConfig>)>> {
+        let mut client = DtlsClient::connect(server_url, None).await?;
+        let _ = client.send(&SignalingMessage::GetIceServers).await;
+
+        match tokio::time::timeout(Duration::from_secs(3), client.recv()).await {
+            Ok(Ok(SignalingMessage::IceServers { ice_servers })) => {
+                info!("Received ICE server config ({} servers) from signaling server", ice_servers.len());
+                let servers = ice_servers.into_iter().map(|s| IceServerConfig {
+                    urls: s.urls,
+                    username: s.username,
+                    credential: s.credential,
+                }).collect();
+                Ok(Some((client, servers)))
+            }
+            Ok(Ok(other)) => {
+                warn!("Unexpected response to GetIceServers: {:?}, using defaults", other);
+                client.close();
+                Ok(None)
+            }
+            Ok(Err(e)) => {
+                warn!("Error receiving ICE servers: {}, using defaults", e);
+                client.close();
+                Ok(None)
+            }
+            Err(_) => {
+                info!("GetIceServers timed out (old server), will reconnect");
+                client.close();
+                Ok(None)
+            }
+        }
+    }
+
     /// Connect to DTLS server, create WebRTC offer, exchange signaling, return PC + DC
     async fn establish_webrtc(
         &self,
         target_host: &str,
         target_port: u16,
     ) -> Result<(Arc<PeerConnection>, Arc<DataChannel>, tokio::sync::mpsc::UnboundedReceiver<Bytes>)> {
-        let mut dtls_client = DtlsClient::connect(&self.server_url, None).await?;
-        info!("DTLS connected to signaling server {}", self.server_url);
-
-        // Request ICE server configuration (STUN + TURN with temporary credentials)
-        info!("Requesting ICE server config from signaling server");
-        let _ = dtls_client.send(&SignalingMessage::GetIceServers).await;
-
-        let extra_ice_servers: Vec<IceServerConfig> = match tokio::time::timeout(
-            Duration::from_secs(5),
-            dtls_client.recv(),
-        ).await {
-            Ok(Ok(SignalingMessage::IceServers { ice_servers })) => {
-                info!("Received ICE server config ({} servers) from signaling server", ice_servers.len());
-                ice_servers.into_iter().map(|s| IceServerConfig {
-                    urls: s.urls,
-                    username: s.username,
-                    credential: s.credential,
-                }).collect()
-            }
-            Ok(Ok(other)) => {
-                warn!("Expected IceServers after GetIceServers, got {:?}, using defaults", other);
-                vec![]
-            }
-            Ok(Err(e)) => {
-                warn!("Error receiving ICE servers: {}, using defaults", e);
-                vec![]
-            }
-            Err(_) => {
-                info!("No ICE server config from server (timeout), using defaults");
-                vec![]
-            }
-        };
+        // Try GetIceServers. On timeout/error the DTLS connection is dead
+        // (old server dropped us), so reconnect without it.
+        let (mut dtls_client, extra_ice_servers) =
+            match Self::connect_dtls_and_get_ice_servers(&self.server_url).await {
+                Ok(Some((client, servers))) => {
+                    info!("Connected with ICE server config from signaling server");
+                    (client, servers)
+                }
+                _ => {
+                    info!("Connecting without ICE server config (old server or fallback)");
+                    let client = DtlsClient::connect(&self.server_url, None).await?;
+                    info!("DTLS connected (fallback)");
+                    (client, vec![])
+                }
+            };
 
         let peer_connection = self.webrtc_config.create_peer_connection_with(&extra_ice_servers).await?;
 
