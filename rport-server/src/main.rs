@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = ServerCli::parse();
 
     let log_filter = if cli.debug {
-        EnvFilter::new("debug,hyper=warn,gather=warn,igd=warn,neli=warn,rustls_platform_verifier=warn")
+        EnvFilter::new("debug,hyper=warn,gather=warn,igd=warn,neli=warn,rustls_platform_verifier=warn,turn=off")
     } else {
         EnvFilter::from_default_env()
     };
