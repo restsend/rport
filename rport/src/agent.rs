@@ -437,6 +437,23 @@ async fn handle_offer(
         }));
     }
 
+    // Monitor selected ICE candidate pair — fires when a pair is nominated.
+    {
+        let mut pair_rx = peer_connection.ice_transport().subscribe_selected_pair();
+        tasks.push(tokio::spawn(async move {
+            while pair_rx.changed().await.is_ok() {
+                if let Some(ref pair) = *pair_rx.borrow() {
+                    info!(
+                        "ICE pair nominated (agent): local {} {:?} {} -> remote {} {:?} {} [nominated={}]",
+                        pair.local.address, pair.local.typ, pair.local.transport,
+                        pair.remote.address, pair.remote.typ, pair.remote.transport,
+                        pair.nominated,
+                    );
+                }
+            }
+        }));
+    }
+
     // Send answer — if this fails, clean up spawned tasks
     let answer_result: Result<(), anyhow::Error> = async {
         let answer = peer_connection.create_answer().await?;
@@ -477,6 +494,10 @@ async fn handle_offer(
                     result = candidate_rx.recv() => {
                         match result {
                             Ok(candidate) => {
+                                info!(
+                                    "Local ICE candidate: {} {} {} {:?}",
+                                    candidate.address, candidate.transport, candidate.priority, candidate.typ,
+                                );
                                 let _ = send_message(&dtls_c, &SignalingMessage::Candidate {
                                     session_id: sid.clone(),
                                     candidate: candidate.to_sdp(),

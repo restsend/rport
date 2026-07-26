@@ -84,6 +84,14 @@ where
             match event {
                 DataChannelEvent::Open => {
                     debug!("Local data channel Open event");
+                    if let Some(pair) = pc_disc.ice_transport().get_selected_pair() {
+                        info!(
+                            "ICE selected pair: local {} {:?} {} -> remote {} {:?} {} [nominated={}]",
+                            pair.local.address, pair.local.typ, pair.local.transport,
+                            pair.remote.address, pair.remote.typ, pair.remote.transport,
+                            pair.nominated,
+                        );
+                    }
                     if let Some(tx) = open_tx.take() { let _ = tx.send(()); }
                 }
                 DataChannelEvent::Message(data) => {
@@ -253,7 +261,18 @@ where
         _ = webrtc_dead.cancelled() => { tracing::debug!("forward_stream_to_webrtc: exiting due to WebRTC disconnect"); }
         _ = dc_closed.cancelled() => { tracing::debug!("forward_stream_to_webrtc: data channel closed by remote"); }
         _ = input_task => {
-            tracing::debug!("forward_stream_to_webrtc: input closed, waiting for drain");
+            // Check if WebRTC is already dead — distinguish clean local EOF
+            // from a remote disconnect that caused stdin to close.
+            let pc_state = *peer_connection.subscribe_peer_state().borrow();
+            if matches!(pc_state, rustrtc::PeerConnectionState::Failed | rustrtc::PeerConnectionState::Closed)
+                || dc_closed.is_cancelled()
+            {
+                let reason = peer_connection.disconnect_reason()
+                    .map(|r| format!(" ({})", r)).unwrap_or_default();
+                tracing::warn!("Connection lost: remote WebRTC disconnected{} — session terminated", reason);
+            } else {
+                tracing::debug!("forward_stream_to_webrtc: input closed, waiting for drain");
+            }
             tokio::select! {
                 _ = tokio::time::sleep(DRAIN_TIMEOUT) => {}
                 _ = dc_closed.cancelled() => {}
@@ -541,6 +560,10 @@ impl CliClient {
                     result = candidate_rx.recv() => {
                         match result {
                             Ok(candidate) => {
+                                info!(
+                                    "Local ICE candidate: {} {} {} {:?}",
+                                    candidate.address, candidate.transport, candidate.priority, candidate.typ,
+                                );
                                 let _ = send_message(&dtls, &SignalingMessage::Candidate {
                                     session_id: sid.clone(),
                                     candidate: candidate.to_sdp(),
@@ -567,6 +590,23 @@ impl CliClient {
                 }
             }
         });
+
+        // Monitor selected ICE candidate pair — fires when a pair is nominated.
+        {
+            let mut pair_rx = peer_connection.ice_transport().subscribe_selected_pair();
+            tokio::spawn(async move {
+                while pair_rx.changed().await.is_ok() {
+                    if let Some(ref pair) = *pair_rx.borrow() {
+                        info!(
+                            "ICE pair nominated: local {} {:?} {} -> remote {} {:?} {} [nominated={}]",
+                            pair.local.address, pair.local.typ, pair.local.transport,
+                            pair.remote.address, pair.remote.typ, pair.remote.transport,
+                            pair.nominated,
+                        );
+                    }
+                }
+            });
+        }
 
         // Subscribe to PeerConnection state so we can detect Connected and
         // break the answer loop as soon as ICE completes (instead of waiting
@@ -627,14 +667,6 @@ impl CliClient {
                     let state = *pc_state_rx.borrow_and_update();
                     match state {
                         rustrtc::PeerConnectionState::Connected => {
-                            if let Some(pair) = peer_connection.ice_transport().get_selected_pair() {
-                                info!(
-                                    "ICE selected pair: local {} {:?} {} -> remote {} {:?} {} [nominated={}]",
-                                    pair.local.address, pair.local.typ, pair.local.transport,
-                                    pair.remote.address, pair.remote.typ, pair.remote.transport,
-                                    pair.nominated,
-                                );
-                            }
                             info!("WebRTC connected");
                             break;
                         }
