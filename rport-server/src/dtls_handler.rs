@@ -27,6 +27,13 @@ pub struct Target {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IceServerInfo {
+    pub urls: Vec<String>,
+    pub username: Option<String>,
+    pub credential: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SignalingMessage {
     #[serde(rename = "register")]
@@ -39,6 +46,10 @@ pub enum SignalingMessage {
     Candidate { session_id: String, candidate: String },
     #[serde(rename = "end-of-candidates")]
     EndOfCandidates { session_id: String },
+    #[serde(rename = "ice-servers")]
+    IceServers { ice_servers: Vec<IceServerInfo> },
+    #[serde(rename = "get-ice-servers")]
+    GetIceServers,
     #[serde(rename = "error")]
     Error { session_id: String, reason: String },
     #[serde(rename = "ping")]
@@ -173,9 +184,16 @@ impl DtlsHandler {
             let feed_handle = tokio::spawn(async move {
                 let mut state_rx = dtls_c.subscribe_state();
                 loop {
-                    if let DtlsState::Connected(_, _) = *state_rx.borrow() {
-                        info!("DTLS handshake succeeded: {}", addr);
-                        break;
+                    match *state_rx.borrow() {
+                        DtlsState::Connected(_, _) => {
+                            info!("DTLS handshake succeeded: {}", addr);
+                            break;
+                        }
+                        DtlsState::Failed => {
+                            warn!("DTLS handshake failed for {} (state=Failed)", addr);
+                            return;
+                        }
+                        _ => {}
                     }
                     if state_rx.changed().await.is_err() {
                         warn!("DTLS handshake failed for {}", addr);
@@ -184,11 +202,35 @@ impl DtlsHandler {
                 }
 
                 let mut data_rx = data_rx;
-                let first_msg = match recv_msg(&mut data_rx).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        warn!("Failed to read first message from {}: {}", addr, e);
-                        return;
+
+                // Loop to handle GetIceServers before Register/Offer (backward compatible)
+                let first_msg = loop {
+                    let msg = match recv_msg(&mut data_rx).await {
+                        Ok(m) => m,
+                        Err(e) => {
+                            warn!("Failed to read first message from {}: {}", addr, e);
+                            return;
+                        }
+                    };
+                    match msg {
+                        SignalingMessage::GetIceServers => {
+                            let mut ice_servers = vec![IceServerInfo {
+                                urls: vec![state_c.turn_server.get_stun_url()],
+                                username: None,
+                                credential: None,
+                            }];
+                            if let Some(creds) = state_c.turn_server.generate_credentials().await {
+                                ice_servers.push(IceServerInfo {
+                                    urls: vec![state_c.turn_server.get_turn_url()],
+                                    username: Some(creds.username),
+                                    credential: Some(creds.password),
+                                });
+                            }
+                            info!("Sending ICE server config ({} servers) to {} in response to GetIceServers", ice_servers.len(), addr);
+                            let _ = send_msg(&dtls_c, &SignalingMessage::IceServers { ice_servers }).await;
+                            continue;
+                        }
+                        other => break other,
                     }
                 };
 

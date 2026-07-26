@@ -56,6 +56,21 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let ice_servers = config.ice_servers.clone();
     let upnp = config.upnp.unwrap_or(false);
 
+    // Initialize tracing — both agent and client modes share the same logic
+    if let Some(log_file) = config.log_file.as_ref() {
+        let file = std::fs::OpenOptions::new()
+            .create(true).append(true).open(log_file)?;
+        tracing_subscriber::fmt()
+            .with_env_filter(log_env)
+            .with_writer(file)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(log_env)
+            .with_writer(std::io::stderr)
+            .init();
+    }
+
     let is_agent_mode = !cli_allow.is_empty();
     let is_client_mode = !forwards.is_empty();
 
@@ -79,7 +94,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     })?;
 
     if is_agent_mode {
-        tracing_subscriber::fmt().with_env_filter(log_env).init();
         let agent_id = cli_id.as_deref().unwrap_or("default");
         let acl = crate::acl::parse_allow_rules(&cli_allow)
             .map_err(|e| anyhow::anyhow!("Invalid --allow rule: {}", e))?;
@@ -94,20 +108,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let is_proxy_command = forwards.iter().any(|f| f.is_proxy_command());
         if forwards.len() > 1 && is_proxy_command {
             anyhow::bail!("ProxyCommand mode (-L host:port) cannot be combined with other -L specs");
-        }
-
-        if let Some(log_file) = config.log_file.clone() {
-            let file = std::fs::OpenOptions::new()
-                .create(true).append(true).open(log_file)?;
-            tracing_subscriber::fmt()
-                .with_env_filter(log_env)
-                .with_writer(file)
-                .init();
-        } else {
-            tracing_subscriber::fmt()
-                .with_env_filter(log_env)
-                .with_writer(std::io::stderr)
-                .init();
         }
 
         let client = CliClient::new(srv, tok, agent_id, ice_servers, upnp, wait_candidates, &config);

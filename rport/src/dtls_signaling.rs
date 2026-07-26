@@ -20,6 +20,13 @@ pub struct Target {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IceServerInfo {
+    pub urls: Vec<String>,
+    pub username: Option<String>,
+    pub credential: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SignalingMessage {
     #[serde(rename = "register")]
@@ -32,6 +39,10 @@ pub enum SignalingMessage {
     Candidate { session_id: String, candidate: String },
     #[serde(rename = "end-of-candidates")]
     EndOfCandidates { session_id: String },
+    #[serde(rename = "ice-servers")]
+    IceServers { ice_servers: Vec<IceServerInfo> },
+    #[serde(rename = "get-ice-servers")]
+    GetIceServers,
     #[serde(rename = "error")]
     Error { session_id: String, reason: String },
     #[serde(rename = "ping")]
@@ -130,9 +141,17 @@ impl DtlsClient {
         let mut state_rx = dtls.subscribe_state();
         debug!("DTLS client handshake starting, initial state: {}", *state_rx.borrow());
         loop {
-            if let DtlsState::Connected(_, _) = *state_rx.borrow() {
-                info!("DTLS client handshake succeeded: connected to {}", remote_addr);
-                break;
+            match *state_rx.borrow() {
+                DtlsState::Connected(_, _) => {
+                    info!("DTLS client handshake succeeded: connected to {}", remote_addr);
+                    break;
+                }
+                DtlsState::Failed => {
+                    warn!("DTLS client handshake failed (state=Failed)");
+                    dtls.close();
+                    return Err(anyhow!("DTLS handshake failed to {}", addr));
+                }
+                _ => {}
             }
             if state_rx.changed().await.is_err() {
                 let last = dtls.get_state();

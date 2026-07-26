@@ -42,16 +42,10 @@ impl WebRTCConfig {
         }
     }
 
-    pub fn get_ice_servers(&self) -> Vec<IceServer> {
-        if !self.ice_servers.is_empty() {
-            return self.ice_servers.clone().into_iter().map(|c| c.into()).collect();
-        }
-        vec![IceServerConfig::default().into()]
-    }
-
-    pub async fn create_peer_connection(&self) -> Result<Arc<PeerConnection>> {
-        let ice_servers = self.get_ice_servers();
-        let config = RtcConfiguration {
+    fn build_rtc_config(&self, extra_ice_servers: Vec<IceServer>) -> RtcConfiguration {
+        let mut ice_servers = self.get_ice_servers();
+        ice_servers.extend(extra_ice_servers);
+        RtcConfiguration {
             ice_servers,
             sctp_rto_initial: self.sctp_rto_initial.unwrap_or_else(|| Duration::from_millis(400)),
             sctp_rto_min: self.sctp_rto_min.unwrap_or_else(|| Duration::from_millis(200)),
@@ -64,7 +58,23 @@ impl WebRTCConfig {
             enable_upnp: self.enable_upnp,
             prefer_srflx_over_natted_host: true,
             ..Default::default()
-        };
+        }
+    }
+
+    pub fn get_ice_servers(&self) -> Vec<IceServer> {
+        if !self.ice_servers.is_empty() {
+            return self.ice_servers.clone().into_iter().map(|c| c.into()).collect();
+        }
+        vec![IceServerConfig::default().into()]
+    }
+
+    pub async fn create_peer_connection(&self) -> Result<Arc<PeerConnection>> {
+        self.create_peer_connection_with([].as_slice()).await
+    }
+
+    pub async fn create_peer_connection_with(&self, extra_ice_servers: &[IceServerConfig]) -> Result<Arc<PeerConnection>> {
+        let extra = extra_ice_servers.iter().map(|c| IceServer::from(c.clone())).collect();
+        let config = self.build_rtc_config(extra);
         let peer_connection = Arc::new(PeerConnection::new(config));
         Ok(peer_connection)
     }

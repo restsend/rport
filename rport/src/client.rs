@@ -10,7 +10,7 @@ use rustrtc::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{ForwardMapping, IceServerConfig, RportConfig};
 use crate::dtls_signaling::{send_message, DtlsClient, SignalingMessage, Target};
@@ -80,8 +80,12 @@ where
         let mut open_tx = Some(open_tx);
         while let Some(event) = dc_clone.recv().await {
             match event {
-                DataChannelEvent::Open => { if let Some(tx) = open_tx.take() { let _ = tx.send(()); } }
+                DataChannelEvent::Open => {
+                    debug!("Local data channel Open event");
+                    if let Some(tx) = open_tx.take() { let _ = tx.send(()); }
+                }
                 DataChannelEvent::Message(data) => {
+                    debug!("Local data channel received {} bytes", data.len());
                     if let Some(ref s) = stats_clone {
                         s.bytes_recv.fetch_add(data.len() as u64, Ordering::Relaxed);
                         s.packets_recv.fetch_add(1, Ordering::Relaxed);
@@ -100,9 +104,11 @@ where
     });
 
     let connect_timeout = connect_timeout.unwrap_or(30);
+    debug!("Waiting for data channel to open (timeout: {}s)...", connect_timeout);
     if let Err(_) = tokio::time::timeout(Duration::from_secs(connect_timeout.into()), open_rx).await {
         return Err(anyhow!("Data channel open timeout"));
     }
+    debug!("Data channel is open, starting forwarding");
 
     const DISCONNECT_GRACE: Duration = Duration::from_secs(15);
     let pc_monitor = peer_connection.clone();
@@ -161,17 +167,18 @@ where
         let mut buffer = [0u8; 1200];
         loop {
             match input.read(&mut buffer).await {
-                Ok(0) => { tracing::debug!("forward_stream_to_webrtc: input EOF"); break; }
+                Ok(0) => { debug!("forward_stream_to_webrtc: input EOF"); break; }
                 Ok(n) => {
+                    debug!("Sending {} bytes to WebRTC (dc_id={})", n, dc_id);
                     if let Some(ref s) = stats_input {
                         s.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
                         s.packets_sent.fetch_add(1, Ordering::Relaxed);
                     }
                     if let Err(e) = pc_clone.send_data(dc_id, &buffer[..n]).await {
-                        tracing::error!("Failed to send data through WebRTC: {}", e); break;
+                        error!("Failed to send data through WebRTC: {}", e); break;
                     }
                 }
-                Err(e) => { tracing::debug!("forward_stream_to_webrtc: input read failed: {}", e); break; }
+                Err(e) => { debug!("forward_stream_to_webrtc: input read failed: {}", e); break; }
             }
         }
     };
@@ -182,6 +189,7 @@ where
                 data = msg_rx.recv() => {
                     match data {
                         Some(data) => {
+                            debug!("Writing {} bytes to TCP (from local DC)", data.len());
                             if output.write_all(&data).await.is_err() { break; }
                             if output.flush().await.is_err() { break; }
                         }
@@ -191,6 +199,7 @@ where
                 data = remote_msg_rx.recv() => {
                     match data {
                         Some(data) => {
+                            debug!("Writing {} bytes to TCP (from remote DC)", data.len());
                             if output.write_all(&data).await.is_err() { break; }
                             if output.flush().await.is_err() { break; }
                         }
@@ -352,7 +361,37 @@ impl CliClient {
         let mut dtls_client = DtlsClient::connect(&self.server_url, None).await?;
         info!("DTLS connected to signaling server {}", self.server_url);
 
-        let peer_connection = self.webrtc_config.create_peer_connection().await?;
+        // Request ICE server configuration (STUN + TURN with temporary credentials)
+        info!("Requesting ICE server config from signaling server");
+        let _ = dtls_client.send(&SignalingMessage::GetIceServers).await;
+
+        let extra_ice_servers: Vec<IceServerConfig> = match tokio::time::timeout(
+            Duration::from_secs(5),
+            dtls_client.recv(),
+        ).await {
+            Ok(Ok(SignalingMessage::IceServers { ice_servers })) => {
+                info!("Received ICE server config ({} servers) from signaling server", ice_servers.len());
+                ice_servers.into_iter().map(|s| IceServerConfig {
+                    urls: s.urls,
+                    username: s.username,
+                    credential: s.credential,
+                }).collect()
+            }
+            Ok(Ok(other)) => {
+                warn!("Expected IceServers after GetIceServers, got {:?}, using defaults", other);
+                vec![]
+            }
+            Ok(Err(e)) => {
+                warn!("Error receiving ICE servers: {}, using defaults", e);
+                vec![]
+            }
+            Err(_) => {
+                info!("No ICE server config from server (timeout), using defaults");
+                vec![]
+            }
+        };
+
+        let peer_connection = self.webrtc_config.create_peer_connection_with(&extra_ice_servers).await?;
 
         let label = format!("fwd:{}:{}", target_host, target_port);
         let dc_config = DataChannelConfig {
@@ -366,6 +405,7 @@ impl CliClient {
 
         let pc_drain = peer_connection.clone();
         let rt = remote_msg_tx.clone();
+        let drain_label = label.clone();
         tokio::spawn(async move {
             while let Some(event) = pc_drain.recv().await {
                 if let PeerConnectionEvent::DataChannel(dc) = event {
@@ -376,13 +416,21 @@ impl CliClient {
                         while let Some(event) = dc.recv().await {
                             match event {
                                 DataChannelEvent::Message(data) => {
+                                    debug!("Remote DC '{}' received {} bytes from agent", label, data.len());
                                     let _ = tx.send(data);
                                 }
-                                DataChannelEvent::Close => break,
-                                _ => {}
+                                DataChannelEvent::Close => {
+                                    debug!("Remote DC '{}' closed by agent", label);
+                                    break;
+                                }
+                                other => {
+                                    debug!("Remote DC '{}' event: {:?}", label, other);
+                                }
                             }
                         }
                     });
+                } else {
+                    debug!("Peer connection event (non-DC) for '{}'", drain_label);
                 }
             }
         });
@@ -458,55 +506,90 @@ impl CliClient {
             }
         });
 
+        // Subscribe to PeerConnection state so we can detect Connected and
+        // break the answer loop as soon as ICE completes (instead of waiting
+        // for EndOfCandidates from the agent).  Combined with the rustrtc fix
+        // (no premature IceTransportState::Failed when the first batch of
+        // connectivity checks has no successful pairs), trickle candidates
+        // arriving after the answer will trigger new checks and ICE will
+        // eventually connect.
+        let mut pc_state_rx = peer_connection.subscribe_peer_state();
+        let mut answer_received = false;
+
         loop {
-            let msg = dtls_client.recv().await?;
-            match msg {
-                SignalingMessage::Answer { answer_sdp, .. } => {
-                    let answer = SessionDescription::parse(SdpType::Answer, &answer_sdp)?;
-                    peer_connection.set_remote_description(answer).await?;
-                    info!("WebRTC handshake completed for session {}", session_id);
-                    break;
-                }
-                SignalingMessage::Candidate { candidate, .. } => {
-                    if let Ok(c) = IceCandidate::from_sdp(&candidate) {
-                        peer_connection.add_ice_candidate(c).ok();
+            tokio::select! {
+                msg = dtls_client.recv() => {
+                    let msg = match msg {
+                        Ok(m) => m,
+                        Err(e) => {
+                            debug!("Signaling connection closed during candidate gathering: {}", e);
+                            break;
+                        }
+                    };
+                    match msg {
+                        SignalingMessage::Answer { answer_sdp, .. } => {
+                            info!("Received answer from agent, setting remote description");
+                            let answer = SessionDescription::parse(SdpType::Answer, &answer_sdp)?;
+                            peer_connection.set_remote_description(answer).await?;
+                            info!("WebRTC handshake completed for session {}", session_id);
+                            answer_received = true;
+                        }
+                        SignalingMessage::Candidate { candidate, .. } => {
+                            if candidate.len() > 80 {
+                                debug!("Received ICE candidate (truncated): {}...", &candidate[..80]);
+                            } else {
+                                debug!("Received ICE candidate: {}", candidate);
+                            }
+                            if let Ok(c) = IceCandidate::from_sdp(&candidate) {
+                                peer_connection.add_ice_candidate(c).ok();
+                            }
+                        }
+                        SignalingMessage::EndOfCandidates { .. } => {
+                            debug!("Received end-of-candidates from agent");
+                            if answer_received {
+                                break;
+                            }
+                        }
+                        SignalingMessage::Error { reason, .. } => {
+                            dtls_client.close();
+                            return Err(anyhow!("Agent rejected offer: {}", reason));
+                        }
+                        other => {
+                            debug!("Unexpected message during signaling: {:?}", other);
+                            continue;
+                        }
                     }
                 }
-                SignalingMessage::EndOfCandidates { .. } => {}
-                SignalingMessage::Error { reason, .. } => {
-                    dtls_client.close();
-                    return Err(anyhow!("Agent rejected offer: {}", reason));
+                // ICE has connected — data channel is about to open
+                _ = pc_state_rx.changed() => {
+                    let state = *pc_state_rx.borrow_and_update();
+                    match state {
+                        rustrtc::PeerConnectionState::Connected => {
+                            info!("WebRTC connected");
+                            break;
+                        }
+                        rustrtc::PeerConnectionState::Failed => {
+                            let reason = peer_connection.disconnect_reason()
+                                .map(|r| r.to_string()).unwrap_or_default();
+                            return Err(anyhow!("WebRTC failed: {}", reason));
+                        }
+                        rustrtc::PeerConnectionState::Closed => {
+                            return Err(anyhow!("WebRTC closed"));
+                        }
+                        _ => {
+                            debug!("PeerConnection state: {:?}", state);
+                        }
+                    }
                 }
-                other => {
-                    debug!("Unexpected message during signaling: {:?}", other);
-                    continue;
+                // Long timeout: break even if ICE never connects
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    if answer_received {
+                        warn!("Timeout waiting for ICE to connect, proceeding");
+                        break;
+                    }
                 }
             }
         }
-
-        // Monitor PC state in background
-        let pc_monitor = peer_connection.clone();
-        tokio::spawn(async move {
-            let mut state_rx = pc_monitor.subscribe_peer_state();
-            while let Ok(()) = state_rx.changed().await {
-                match *state_rx.borrow() {
-                    rustrtc::PeerConnectionState::Connected => {
-                        info!("WebRTC connected");
-                    }
-                    rustrtc::PeerConnectionState::Disconnected
-                    | rustrtc::PeerConnectionState::Failed
-                    | rustrtc::PeerConnectionState::Closed => {
-                        if let Some(reason) = pc_monitor.disconnect_reason() {
-                            info!("WebRTC ended: {} (state: {:?})", reason, *state_rx.borrow());
-                        } else {
-                            info!("WebRTC ended: state {:?}", *state_rx.borrow());
-                        }
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        });
 
         Ok((peer_connection, data_channel, remote_msg_rx))
     }

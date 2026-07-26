@@ -112,6 +112,9 @@ impl RportConfig {
         if let Some(connect_timeout) = cli.timeout {
             self.connect_timeout = Some(connect_timeout);
         }
+        if let Some(log_file) = cli.log_file {
+            self.log_file = Some(log_file.to_string_lossy().to_string());
+        }
         self.upnp = Some(cli.upnp);
 
         // Parse -L forward specs

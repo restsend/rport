@@ -33,9 +33,18 @@ async fn main() -> anyhow::Result<()> {
     } else {
         EnvFilter::from_default_env()
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(log_filter)
-        .init();
+    if let Some(ref log_file) = cli.log_file {
+        let file = std::fs::OpenOptions::new()
+            .create(true).append(true).open(log_file)?;
+        tracing_subscriber::fmt()
+            .with_env_filter(log_filter)
+            .with_writer(file)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(log_filter)
+            .init();
+    }
 
     // Start TURN server
     let addr_parts: Vec<&str> = cli.addr.split(':').collect();

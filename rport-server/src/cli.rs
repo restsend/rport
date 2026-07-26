@@ -34,4 +34,8 @@ pub struct ServerCli {
     /// Enable debug logging
     #[arg(long, default_value_t = false)]
     pub debug: bool,
+
+    /// Log file path
+    #[arg(long = "log-file")]
+    pub log_file: Option<String>,
 }

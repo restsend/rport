@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub const RECONNECT_INTERVAL: u64 = 5;
 
@@ -72,6 +72,36 @@ impl Agent {
         let mut client = DtlsClient::connect(&self.server_url, None).await?;
         info!("DTLS connected to server {}", self.server_url);
 
+        // Request ICE server configuration from signaling server
+        info!("Requesting ICE server config from signaling server");
+        let _ = client.send(&SignalingMessage::GetIceServers).await;
+
+        let extra_ice_servers: Vec<IceServerConfig> = match tokio::time::timeout(
+            Duration::from_secs(5),
+            client.recv(),
+        ).await {
+            Ok(Ok(SignalingMessage::IceServers { ice_servers })) => {
+                info!("Received ICE server config ({} servers) from signaling server", ice_servers.len());
+                ice_servers.into_iter().map(|s| IceServerConfig {
+                    urls: s.urls,
+                    username: s.username,
+                    credential: s.credential,
+                }).collect()
+            }
+            Ok(Ok(other)) => {
+                warn!("Expected IceServers after GetIceServers, got {:?}, using defaults", other);
+                vec![]
+            }
+            Ok(Err(e)) => {
+                warn!("Error receiving ICE servers: {}, using defaults", e);
+                vec![]
+            }
+            Err(_) => {
+                info!("No ICE server config from server (timeout), using defaults");
+                vec![]
+            }
+        };
+
         send_message(&client.dtls, &SignalingMessage::Register {
             token: self.token.clone(),
             id: self.id.clone(),
@@ -121,7 +151,7 @@ impl Agent {
 
                         match handle_offer(
                             dtls, &session_id, &offer_sdp, targets,
-                            ac, wc,
+                            ac, wc, &extra_ice_servers,
                         ).await {
                             Ok(pc) => {
                                 active_session = Some(pc);
@@ -165,6 +195,7 @@ async fn handle_offer(
     targets: Option<Vec<Target>>,
     acl: Option<Acl>,
     webrtc_config: WebRTCConfig,
+    extra_ice_servers: &[IceServerConfig],
 ) -> Result<Arc<PeerConnection>> {
     // Resolve targets
     let targets: Vec<(String, u16)> = if let Some(tgts) = targets {
@@ -203,7 +234,7 @@ async fn handle_offer(
     }
 
     // Create WebRTC peer connection
-    let peer_connection = webrtc_config.create_peer_connection().await?;
+    let peer_connection = webrtc_config.create_peer_connection_with(extra_ice_servers).await?;
 
     // Create data channels for each target
     struct FwdTarget {
@@ -264,6 +295,7 @@ async fn handle_offer(
 
                             match TcpStream::connect(format!("{}:{}", h2, port)).await {
                                 Ok(tcp) => {
+                                    info!("TCP connected to {}:{}, forwarding...", h2, port);
                                     let (mut tcp_read, mut tcp_write) = tcp.into_split();
                                     let pc3 = pc2.clone();
                                     tokio::spawn(async move {
@@ -272,12 +304,14 @@ async fn handle_offer(
                                             match tcp_read.read(&mut buf).await {
                                                 Ok(0) | Err(_) => break,
                                                 Ok(n) => {
+                                                    debug!("Agent forwarding {} bytes from TCP to WebRTC (dc_id={})", n, dc_id);
                                                     if pc3.send_data(dc_id, &buf[..n]).await.is_err() { break; }
                                                 }
                                             }
                                         }
                                     });
                                     while let Some(data) = rx.recv().await {
+                                        debug!("Agent writing {} bytes from WebRTC to TCP", data.len());
                                         if tcp_write.write_all(&data).await.is_err() { break; }
                                         let _ = tcp_write.flush().await;
                                     }
@@ -287,6 +321,7 @@ async fn handle_offer(
                         });
                     }
                     DataChannelEvent::Message(data) => {
+                        debug!("Agent DC received {} bytes (before TCP connect)", data.len());
                         let _ = tcp_msg_tx.send(Bytes::from(data));
                     }
                     DataChannelEvent::Close => {
