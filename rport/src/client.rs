@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -14,6 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{ForwardMapping, IceServerConfig, RportConfig};
 use crate::dtls_signaling::{send_message, DtlsClient, SignalingMessage, Target};
+use crate::reliable::ReliableSession;
 use crate::webrtc_config::WebRTCConfig;
 use uuid::Uuid;
 
@@ -543,14 +545,23 @@ impl CliClient {
             }]),
         )).await?;
 
+        // Reliable session for seq/ack exchange with agent
+        let reliable = Arc::new(Mutex::new(ReliableSession::new(
+            Duration::from_millis(2000),
+            3,
+        )));
+
         // Trickle ICE: forward gathered candidates as they arrive
         let mut candidate_rx = peer_connection.subscribe_ice_candidates();
         let mut gathering_state_rx = peer_connection.subscribe_ice_gathering_state();
         let dtls = dtls_client.dtls.clone();
+        let rel = reliable.clone();
         let sid = session_id.clone();
         tokio::spawn(async move {
             if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                let _ = send_message(&dtls, &SignalingMessage::new_end_of_candidates(sid.clone())).await;
+                let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());
+                rel.lock().unwrap().prepare_send(&mut msg, false);
+                let _ = send_message(&dtls, &msg).await;
                 return;
             }
             loop {
@@ -562,12 +573,16 @@ impl CliClient {
                                     "Local ICE candidate: {} {} {} {:?}",
                                     candidate.address, candidate.transport, candidate.priority, candidate.typ,
                                 );
-                                let _ = send_message(&dtls, &SignalingMessage::new_candidate(
+                                let mut msg = SignalingMessage::new_candidate(
                                     sid.clone(),
                                     candidate.to_sdp(),
-                                )).await;
+                                );
+                                rel.lock().unwrap().prepare_send(&mut msg, false);
+                                let _ = send_message(&dtls, &msg).await;
                                 if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                                    let _ = send_message(&dtls, &SignalingMessage::new_end_of_candidates(sid.clone())).await;
+                                    let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());
+                                    rel.lock().unwrap().prepare_send(&mut msg, false);
+                                    let _ = send_message(&dtls, &msg).await;
                                     break;
                                 }
                             }
@@ -577,7 +592,9 @@ impl CliClient {
                     }
                     _ = gathering_state_rx.changed() => {
                         if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                            let _ = send_message(&dtls, &SignalingMessage::new_end_of_candidates(sid.clone())).await;
+                            let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());
+                            rel.lock().unwrap().prepare_send(&mut msg, false);
+                            let _ = send_message(&dtls, &msg).await;
                             break;
                         }
                     }
@@ -623,6 +640,7 @@ impl CliClient {
                             break;
                         }
                     };
+                    reliable.lock().unwrap().process_recv(&msg);
                     match msg {
                         SignalingMessage::Answer { answer_sdp, .. } => {
                             info!("Received answer from agent, setting remote description");
@@ -693,6 +711,18 @@ impl CliClient {
                     }
                 }
             }
+        }
+
+        // Send ack for last received seq from agent so it stops retransmitting.
+        // Lock is dropped before .await to avoid MutexGuard !Send issues.
+        let ack_seq = reliable.lock().unwrap().last_recv_seq();
+        if let Some(seq) = ack_seq {
+            let mut ack_msg = SignalingMessage::new_ack(session_id.clone(), seq);
+            {
+                let mut guard = reliable.lock().unwrap();
+                guard.prepare_send(&mut ack_msg, false);
+            }
+            let _ = dtls_client.send(&ack_msg).await;
         }
 
         Ok((peer_connection, data_channel, remote_msg_rx))
