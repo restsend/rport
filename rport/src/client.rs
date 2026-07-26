@@ -55,11 +55,13 @@ pub fn spawn_stats_reporter(label: &str, stats: Arc<ForwardStats>) {
 
 //=== Generic stream ↔ WebRTC forwarder ===
 
+#[allow(clippy::too_many_arguments)]
 pub async fn forward_stream_to_webrtc<R, W>(
     peer_connection: Arc<PeerConnection>,
     data_channel: Arc<DataChannel>,
     connect_timeout: Option<u32>,
     stats: Option<Arc<ForwardStats>>,
+    label: String,
     mut input: R,
     mut output: W,
     mut remote_msg_rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
@@ -108,6 +110,47 @@ where
         return Err(anyhow!("Data channel open timeout"));
     }
     debug!("Data channel is open, starting forwarding");
+
+    // Periodic link-stats logger: every 10s prints SCTP-level throughput,
+    // smoothed RTT, retransmission timeout and retransmit count for this
+    // connection, plus app-level bytes when a ForwardStats is attached.
+    {
+        let pc_stats = peer_connection.clone();
+        let app_stats = stats.clone();
+        let stats_label = label.clone();
+        tokio::spawn(async move {
+            let mut prev_sent = 0u64;
+            let mut prev_recv = 0u64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let s = match pc_stats.sctp_link_stats() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let d_sent = s.bytes_sent.saturating_sub(prev_sent);
+                let d_recv = s.bytes_received.saturating_sub(prev_recv);
+                prev_sent = s.bytes_sent;
+                prev_recv = s.bytes_received;
+                let up_kbps = d_sent as f64 / 10.0 / 1024.0;
+                let dn_kbps = d_recv as f64 / 10.0 / 1024.0;
+                let srtt_ms = s.srtt.as_secs_f64() * 1000.0;
+                let rto_ms = s.rto.as_secs_f64() * 1000.0;
+                let app = app_stats.as_ref().map(|a| {
+                    let bs = a.bytes_sent.load(Ordering::Relaxed);
+                    let br = a.bytes_recv.load(Ordering::Relaxed);
+                    format!(" | app: {}B↑ {}B↓", bs, br)
+                }).unwrap_or_default();
+                info!(
+                    "[link] {} | sctp sent {:.1}KB ({:.1}KB/s) recv {:.1}KB ({:.1}KB/s) | srtt {:.1}ms rto {:.0}ms retrans {} dur {:.0}s{}",
+                    stats_label,
+                    s.bytes_sent as f64 / 1024.0, up_kbps,
+                    s.bytes_received as f64 / 1024.0, dn_kbps,
+                    srtt_ms, rto_ms, s.retransmissions, s.duration.as_secs(),
+                    app,
+                );
+            }
+        });
+    }
 
     const DISCONNECT_GRACE: Duration = Duration::from_secs(15);
     let pc_monitor = peer_connection.clone();
@@ -270,6 +313,7 @@ impl CliClient {
         let (pc, dc, remote_rx) = self.establish_webrtc(target_host, target_port).await?;
         forward_stream_to_webrtc(
             pc, dc, connect_timeout, None,
+            format!("proxy -> {}:{}", target_host, target_port),
             tokio::io::stdin(), tokio::io::stdout(), remote_rx,
         ).await
     }
@@ -326,7 +370,9 @@ impl CliClient {
                                 match client.establish_webrtc(&host_clone, port).await {
                                     Ok((pc, dc, remote_rx)) => {
                                         if let Err(e) = forward_stream_to_webrtc(
-                                            pc, dc, timeout, Some(stats), reader, writer, remote_rx,
+                                            pc, dc, timeout, Some(stats),
+                                            format!("localhost:{} -> {}:{}", local_port, host_clone, port),
+                                            reader, writer, remote_rx,
                                         ).await {
                                             error!("Forwarding error: {}", e);
                                         }
@@ -581,6 +627,14 @@ impl CliClient {
                     let state = *pc_state_rx.borrow_and_update();
                     match state {
                         rustrtc::PeerConnectionState::Connected => {
+                            if let Some(pair) = peer_connection.ice_transport().get_selected_pair() {
+                                info!(
+                                    "ICE selected pair: local {} {:?} {} -> remote {} {:?} {} [nominated={}]",
+                                    pair.local.address, pair.local.typ, pair.local.transport,
+                                    pair.remote.address, pair.remote.typ, pair.remote.transport,
+                                    pair.nominated,
+                                );
+                            }
                             info!("WebRTC connected");
                             break;
                         }

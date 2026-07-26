@@ -11,14 +11,16 @@ use rustrtc::{
         dtls::DtlsTransport,
         sctp::{DataChannelConfig, DataChannelEvent},
     },
-    IceCandidate, IceGatheringState, PeerConnection, SdpType, SessionDescription,
+    IceCandidate, IceGatheringState, PeerConnection, PeerConnectionState, SdpType,
+    SessionDescription,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub const RECONNECT_INTERVAL: u64 = 5;
 
@@ -144,21 +146,42 @@ impl Agent {
         };
 
         let message_loop = async {
-            let mut active_session: Option<ActiveSession> = None;
+            // One agent can serve multiple concurrent client sessions, each
+            // keyed by its server-assigned session_id. A session reaps itself
+            // when its peer connection reaches a terminal state (Failed/Closed)
+            // by reporting back on `done_tx`.
+            let mut active_sessions: HashMap<String, ActiveSession> = HashMap::new();
+            let (done_tx, mut done_rx) = mpsc::unbounded_channel::<String>();
 
             loop {
-                let msg = match tokio::time::timeout(
-                    Duration::from_secs(45),
-                    recv_message(&mut client.data_rx),
-                ).await {
-                    Ok(Ok(m)) => m,
-                    Ok(Err(e)) => {
-                        error!("DTLS recv error: {}", e);
-                        break;
+                let msg = tokio::select! {
+                    biased;
+                    // Self-reap: a session's peer connection ended.
+                    sid = done_rx.recv() => {
+                        if let Some(sid) = sid {
+                            if let Some(mut session) = active_sessions.remove(&sid) {
+                                info!("Session {} ended ({} active session(s) remain)",
+                                      sid, active_sessions.len());
+                                session.close();
+                            }
+                        }
+                        continue;
                     }
-                    Err(_) => {
-                        warn!("DTLS recv timeout (45s)");
-                        break;
+                    msg_result = tokio::time::timeout(
+                        Duration::from_secs(45),
+                        recv_message(&mut client.data_rx),
+                    ) => {
+                        match msg_result {
+                            Ok(Ok(m)) => m,
+                            Ok(Err(e)) => {
+                                error!("DTLS recv error: {}", e);
+                                break;
+                            }
+                            Err(_) => {
+                                warn!("DTLS recv timeout (45s)");
+                                break;
+                            }
+                        }
                     }
                 };
 
@@ -169,31 +192,38 @@ impl Agent {
                         let wc = self.webrtc_config.clone();
                         let ac = self.acl.clone();
 
-                        // Drop previous session (close PC + abort tasks)
-                        if let Some(mut session) = active_session.take() {
-                            session.close();
+                        // Replace a prior session with the same id (client reconnect).
+                        if let Some(mut old) = active_sessions.remove(&session_id) {
+                            info!("Replacing existing session {}", session_id);
+                            old.close();
                         }
 
                         match handle_offer(
                             dtls, &session_id, &offer_sdp, targets,
                             ac, wc, &extra_ice_servers,
+                            done_tx.clone(),
                         ).await {
                             Ok(session) => {
-                                active_session = Some(session);
+                                active_sessions.insert(session_id.clone(), session);
+                                info!("Session {} active ({} total)", session_id, active_sessions.len());
                             }
                             Err(e) => {
                                 error!("Failed to handle offer {}: {}", session_id, e);
                             }
                         }
                     }
-                    SignalingMessage::Candidate { candidate, .. } => {
-                        if let Some(ref session) = active_session {
+                    SignalingMessage::Candidate { session_id, candidate, .. } => {
+                        if let Some(session) = active_sessions.get(&session_id) {
                             if let Ok(c) = IceCandidate::from_sdp(&candidate) {
                                 session.pc.add_ice_candidate(c).ok();
                             }
+                        } else {
+                            debug!("Candidate for unknown session {}, ignoring", session_id);
                         }
                     }
-                    SignalingMessage::EndOfCandidates { .. } => {}
+                    SignalingMessage::EndOfCandidates { session_id } => {
+                        debug!("End-of-candidates for session {}", session_id);
+                    }
                     SignalingMessage::Ping => {
                         send_message(&client.dtls, &SignalingMessage::Pong).await.ok();
                     }
@@ -203,8 +233,8 @@ impl Agent {
                 }
             }
 
-            // Cleanup active session on exit
-            if let Some(mut session) = active_session.take() {
+            // Cleanup all active sessions on exit
+            for (_, mut session) in active_sessions.drain() {
                 session.close();
             }
         };
@@ -218,6 +248,7 @@ impl Agent {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_offer(
     dtls: Arc<DtlsTransport>,
     session_id: &str,
@@ -226,6 +257,7 @@ async fn handle_offer(
     acl: Option<Acl>,
     webrtc_config: WebRTCConfig,
     extra_ice_servers: &[IceServerConfig],
+    done_tx: mpsc::UnboundedSender<String>,
 ) -> Result<ActiveSession> {
     // Resolve targets
     let targets: Vec<(String, u16)> = if let Some(tgts) = targets {
@@ -368,6 +400,40 @@ async fn handle_offer(
         let pc_drain = peer_connection.clone();
         tasks.push(tokio::spawn(async move {
             while let Some(_) = pc_drain.recv().await {}
+        }));
+    }
+
+    // Session lifecycle monitor: reap this session from the map when its peer
+    // connection reaches a terminal state. Disconnected is intentionally
+    // ignored (may recover within the ICE grace period); the rustrtc disconnect
+    // monitor promotes long-lived Disconnected -> Failed/Closed.
+    {
+        let pc_watch = peer_connection.clone();
+        let sid = session_id.to_string();
+        let done = done_tx.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut state_rx = pc_watch.subscribe_peer_state();
+            while state_rx.changed().await.is_ok() {
+                let state = *state_rx.borrow();
+                match state {
+                    PeerConnectionState::Failed | PeerConnectionState::Closed => {
+                        debug!("Peer connection for session {} -> {:?}, reaping", sid, state);
+                        let _ = done.send(sid);
+                        return;
+                    }
+                    PeerConnectionState::Connected => {
+                        if let Some(pair) = pc_watch.ice_transport().get_selected_pair() {
+                            info!(
+                                "ICE selected pair (agent): local {} {:?} {} -> remote {} {:?} {} [nominated={}]",
+                                pair.local.address, pair.local.typ, pair.local.transport,
+                                pair.remote.address, pair.remote.typ, pair.remote.transport,
+                                pair.nominated,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }));
     }
 
