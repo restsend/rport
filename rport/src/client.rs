@@ -85,7 +85,6 @@ where
                     if let Some(tx) = open_tx.take() { let _ = tx.send(()); }
                 }
                 DataChannelEvent::Message(data) => {
-                    debug!("Local data channel received {} bytes", data.len());
                     if let Some(ref s) = stats_clone {
                         s.bytes_recv.fetch_add(data.len() as u64, Ordering::Relaxed);
                         s.packets_recv.fetch_add(1, Ordering::Relaxed);
@@ -169,7 +168,6 @@ where
             match input.read(&mut buffer).await {
                 Ok(0) => { debug!("forward_stream_to_webrtc: input EOF"); break; }
                 Ok(n) => {
-                    debug!("Sending {} bytes to WebRTC (dc_id={})", n, dc_id);
                     if let Some(ref s) = stats_input {
                         s.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
                         s.packets_sent.fetch_add(1, Ordering::Relaxed);
@@ -189,7 +187,6 @@ where
                 data = msg_rx.recv() => {
                     match data {
                         Some(data) => {
-                            debug!("Writing {} bytes to TCP (from local DC)", data.len());
                             if output.write_all(&data).await.is_err() { break; }
                             if output.flush().await.is_err() { break; }
                         }
@@ -199,7 +196,6 @@ where
                 data = remote_msg_rx.recv() => {
                     match data {
                         Some(data) => {
-                            debug!("Writing {} bytes to TCP (from remote DC)", data.len());
                             if output.write_all(&data).await.is_err() { break; }
                             if output.flush().await.is_err() { break; }
                         }
@@ -437,7 +433,6 @@ impl CliClient {
                         while let Some(event) = dc.recv().await {
                             match event {
                                 DataChannelEvent::Message(data) => {
-                                    debug!("Remote DC '{}' received {} bytes from agent", label, data.len());
                                     let _ = tx.send(data);
                                 }
                                 DataChannelEvent::Close => {

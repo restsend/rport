@@ -44,7 +44,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let wait_candidates = cli.wait_candidates;
 
     let log_env = if is_debug {
-        EnvFilter::new("debug,hyper=warn,gather=warn,igd=warn,neli=warn,rustls_platform_verifier=warn")
+        EnvFilter::new("debug,hyper=warn,gather=warn,igd=warn,neli=warn,rustls_platform_verifier=warn,rustrtc=info")
     } else {
         EnvFilter::from_default_env()
     };
