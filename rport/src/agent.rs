@@ -511,7 +511,8 @@ async fn handle_offer(
                     r.due_retransmits(Instant::now())
                 };
                 if pending.is_empty() {
-                    if rel.lock().unwrap().is_exhausted() {
+                    let r = rel.lock().unwrap();
+                    if r.is_exhausted() || !r.has_pending() {
                         break;
                     }
                     continue;
