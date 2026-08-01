@@ -97,6 +97,12 @@ where
                     if let Some(tx) = open_tx.take() { let _ = tx.send(()); }
                 }
                 DataChannelEvent::Message(data) => {
+                    if data.is_empty() {
+                        // Zero-length message = EOF marker from agent (remote TCP closed)
+                        debug!("dc→client: EOF marker, closing local connection");
+                        dc_closed_tx.cancel();
+                        break;
+                    }
                     let len = data.len();
                     if let Some(ref s) = stats_clone {
                         s.bytes_recv.fetch_add(len as u64, Ordering::Relaxed);

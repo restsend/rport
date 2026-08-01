@@ -383,15 +383,17 @@ async fn handle_offer(
                                         loop {
                                             match tcp_read.read(&mut buf).await {
                                                 Ok(0) | Err(_) => {
-                                                    debug!("agent tcp_read EOF (sent {} bytes total), closing PC", total);
-                                                    pc3.close();
+                                                    debug!("agent tcp_read EOF (sent {} bytes total), signaling client", total);
+                                                    // Send zero-length message as EOF marker so
+                                                    // the client knows the remote TCP closed.
+                                                    let _ = pc3.send_data(dc_id, &[]).await;
                                                     break;
                                                 }
                                                 Ok(n) => {
                                                     total += n as u64;
                                                     match pc3.send_data(dc_id, &buf[..n]).await {
                                                         Ok(_) => debug!("agent→dc: {} bytes (total {})", n, total),
-                                                        Err(e) => { debug!("agent send_data err: {}", e); pc3.close(); break; }
+                                                        Err(e) => { debug!("agent send_data err: {}", e); break; }
                                                     }
                                                 }
                                             }
@@ -399,8 +401,8 @@ async fn handle_offer(
                                     });
                                     while let Some(data) = rx.recv().await {
                                         if tcp_write.write_all(&data).await.is_err() {
-                                            debug!("agent tcp_write failed, closing PC");
-                                            pc_write.close();
+                                            debug!("agent tcp_write failed, signaling client");
+                                            let _ = pc_write.send_data(dc_id, &[]).await;
                                             break;
                                         }
                                         let _ = tcp_write.flush().await;
