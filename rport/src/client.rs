@@ -97,10 +97,12 @@ where
                     if let Some(tx) = open_tx.take() { let _ = tx.send(()); }
                 }
                 DataChannelEvent::Message(data) => {
+                    let len = data.len();
                     if let Some(ref s) = stats_clone {
-                        s.bytes_recv.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        s.bytes_recv.fetch_add(len as u64, Ordering::Relaxed);
                         s.packets_recv.fetch_add(1, Ordering::Relaxed);
                     }
+                    debug!("dc→client: {} bytes", len);
                     let _ = msg_tx.send(data);
                 }
                 DataChannelEvent::Close => {
@@ -225,6 +227,7 @@ where
                         s.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
                         s.packets_sent.fetch_add(1, Ordering::Relaxed);
                     }
+                    debug!("client→dc: {} bytes", n);
                     if let Err(e) = pc_clone.send_data(dc_id, &buffer[..n]).await {
                         error!("Failed to send data through WebRTC: {}", e); break;
                     }
@@ -240,6 +243,7 @@ where
                 data = msg_rx.recv() => {
                     match data {
                         Some(data) => {
+                            debug!("output_write: {} bytes from local dc", data.len());
                             if output.write_all(&data).await.is_err() { break; }
                             if output.flush().await.is_err() { break; }
                         }
@@ -249,6 +253,7 @@ where
                 data = remote_msg_rx.recv() => {
                     match data {
                         Some(data) => {
+                            debug!("output_write: {} bytes from remote dc", data.len());
                             if output.write_all(&data).await.is_err() { break; }
                             if output.flush().await.is_err() { break; }
                         }

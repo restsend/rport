@@ -378,11 +378,19 @@ async fn handle_offer(
                                     let pc3 = pc2.clone();
                                     tokio::spawn(async move {
                                         let mut buf = [0u8; 1024];
+                                        let mut total: u64 = 0;
                                         loop {
                                             match tcp_read.read(&mut buf).await {
-                                                Ok(0) | Err(_) => break,
+                                                Ok(0) | Err(_) => {
+                                                    debug!("agent tcp_read EOF (sent {} bytes total)", total);
+                                                    break;
+                                                }
                                                 Ok(n) => {
-                                                    if pc3.send_data(dc_id, &buf[..n]).await.is_err() { break; }
+                                                    total += n as u64;
+                                                    match pc3.send_data(dc_id, &buf[..n]).await {
+                                                        Ok(_) => debug!("agent→dc: {} bytes (total {})", n, total),
+                                                        Err(e) => { debug!("agent send_data err: {}", e); break; }
+                                                    }
                                                 }
                                             }
                                         }
