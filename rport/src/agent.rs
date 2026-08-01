@@ -391,10 +391,7 @@ async fn handle_offer(
                                                 }
                                                 Ok(n) => {
                                                     total += n as u64;
-                                                    match pc3.send_data(dc_id, &buf[..n]).await {
-                                                        Ok(_) => debug!("agent→dc: {} bytes (total {})", n, total),
-                                                        Err(e) => { debug!("agent send_data err: {}", e); break; }
-                                                    }
+                                                    if pc3.send_data(dc_id, &buf[..n]).await.is_err() { break; }
                                                 }
                                             }
                                         }
