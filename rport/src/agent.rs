@@ -376,27 +376,33 @@ async fn handle_offer(
                                     let _ = tcp.set_nodelay(true);
                                     let (mut tcp_read, mut tcp_write) = tcp.into_split();
                                     let pc3 = pc2.clone();
+                                    let pc_write = pc2.clone();
                                     tokio::spawn(async move {
                                         let mut buf = [0u8; 1024];
                                         let mut total: u64 = 0;
                                         loop {
                                             match tcp_read.read(&mut buf).await {
                                                 Ok(0) | Err(_) => {
-                                                    debug!("agent tcp_read EOF (sent {} bytes total)", total);
+                                                    debug!("agent tcp_read EOF (sent {} bytes total), closing PC", total);
+                                                    pc3.close();
                                                     break;
                                                 }
                                                 Ok(n) => {
                                                     total += n as u64;
                                                     match pc3.send_data(dc_id, &buf[..n]).await {
                                                         Ok(_) => debug!("agent→dc: {} bytes (total {})", n, total),
-                                                        Err(e) => { debug!("agent send_data err: {}", e); break; }
+                                                        Err(e) => { debug!("agent send_data err: {}", e); pc3.close(); break; }
                                                     }
                                                 }
                                             }
                                         }
                                     });
                                     while let Some(data) = rx.recv().await {
-                                        if tcp_write.write_all(&data).await.is_err() { break; }
+                                        if tcp_write.write_all(&data).await.is_err() {
+                                            debug!("agent tcp_write failed, closing PC");
+                                            pc_write.close();
+                                            break;
+                                        }
                                         let _ = tcp_write.flush().await;
                                     }
                                 }
