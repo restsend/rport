@@ -372,6 +372,8 @@ async fn handle_offer(
                             match TcpStream::connect(format!("{}:{}", h2, port)).await {
                                 Ok(tcp) => {
                                     info!("TCP connected to {}:{}, forwarding...", h2, port);
+                                    // Disable Nagle for interactive protocols (SSH).
+                                    let _ = tcp.set_nodelay(true);
                                     let (mut tcp_read, mut tcp_write) = tcp.into_split();
                                     let pc3 = pc2.clone();
                                     tokio::spawn(async move {
@@ -471,6 +473,17 @@ async fn handle_offer(
         3,
     )));
 
+    // Subscribe to ICE candidate / gathering events BEFORE
+    // set_local_description, because host candidates are gathered almost
+    // instantly once gathering starts and the broadcast channel does not
+    // replay candidates emitted before the subscription exists. Buffering
+    // them here avoids losing host candidates (needed for same-LAN links).
+    let mut candidate_rx = peer_connection.subscribe_ice_candidates();
+    let mut gathering_state_rx = peer_connection.subscribe_ice_gathering_state();
+    let dtls_c = dtls.clone();
+    let sid = session_id.to_string();
+    let rel = reliable.clone();
+
     // Send answer with seq=1 for retransmission tracking
     let answer_result: Result<(), anyhow::Error> = async {
         let answer = peer_connection.create_answer().await?;
@@ -527,11 +540,6 @@ async fn handle_offer(
 
     // Trickle ICE: forward gathered candidates as they arrive
     {
-        let mut candidate_rx = peer_connection.subscribe_ice_candidates();
-        let mut gathering_state_rx = peer_connection.subscribe_ice_gathering_state();
-        let dtls_c = dtls.clone();
-        let sid = session_id.to_string();
-        let rel = reliable.clone();
         tasks.push(tokio::spawn(async move {
             if *gathering_state_rx.borrow() == IceGatheringState::Complete {
                 let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());

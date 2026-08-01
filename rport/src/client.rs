@@ -377,6 +377,10 @@ impl CliClient {
                     match listener.accept().await {
                         Ok((tcp_stream, addr)) => {
                             info!("New connection from {}", addr);
+                            // Disable Nagle: interactive protocols (SSH) send
+                            // small packets that must not be delayed by Nagle's
+                            // algorithm + delayed-ACK, which can stall auth.
+                            let _ = tcp_stream.set_nodelay(true);
                             let (reader, writer) = tcp_stream.into_split();
                             let client = CliClient {
                                 server_url: srv.clone(),
@@ -419,7 +423,7 @@ impl CliClient {
     /// Returns `Ok(Some((client, servers)))` on success.
     /// Returns `Ok(None)` on timeout/old server — client is **dead**.
     /// The caller should close it and reconnect without GetIceServers.
-    async fn connect_dtls_and_get_ice_servers(
+    pub async fn connect_dtls_and_get_ice_servers(
         server_url: &str,
     ) -> Result<Option<(DtlsClient, Vec<IceServerConfig>)>> {
         let mut client = DtlsClient::connect(server_url, None).await?;
@@ -454,7 +458,7 @@ impl CliClient {
     }
 
     /// Connect to DTLS server, create WebRTC offer, exchange signaling, return PC + DC
-    async fn establish_webrtc(
+    pub async fn establish_webrtc(
         &self,
         target_host: &str,
         target_port: u16,
@@ -518,10 +522,29 @@ impl CliClient {
             }
         });
 
+        let session_id = Uuid::new_v4().to_string();
+
+        // Reliable session for seq/ack exchange with agent
+        let reliable = Arc::new(Mutex::new(ReliableSession::new(
+            Duration::from_millis(2000),
+            3,
+        )));
+
+        // Subscribe to ICE candidate / gathering events BEFORE
+        // set_local_description. Host candidates are gathered almost
+        // instantly once gathering begins; the broadcast channel does not
+        // replay candidates emitted before a subscription exists, so
+        // subscribing after set_local_description would silently drop host
+        // candidates and break same-LAN / localhost connectivity. Candidates
+        // are buffered in the receiver until the forwarding task polls them.
+        let mut candidate_rx = peer_connection.subscribe_ice_candidates();
+        let mut gathering_state_rx = peer_connection.subscribe_ice_gathering_state();
+        let dtls = dtls_client.dtls.clone();
+        let rel = reliable.clone();
+        let sid = session_id.clone();
+
         let offer = peer_connection.create_offer().await?;
         peer_connection.set_local_description(offer)?;
-
-        let session_id = Uuid::new_v4().to_string();
 
         // Wait for all ICE candidates before sending offer so that
         // old HTTP/SSE agents (which ignore trickle ICE) get all candidates in the SDP
@@ -545,18 +568,7 @@ impl CliClient {
             }]),
         )).await?;
 
-        // Reliable session for seq/ack exchange with agent
-        let reliable = Arc::new(Mutex::new(ReliableSession::new(
-            Duration::from_millis(2000),
-            3,
-        )));
-
         // Trickle ICE: forward gathered candidates as they arrive
-        let mut candidate_rx = peer_connection.subscribe_ice_candidates();
-        let mut gathering_state_rx = peer_connection.subscribe_ice_gathering_state();
-        let dtls = dtls_client.dtls.clone();
-        let rel = reliable.clone();
-        let sid = session_id.clone();
         tokio::spawn(async move {
             if *gathering_state_rx.borrow() == IceGatheringState::Complete {
                 let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());
@@ -643,11 +655,27 @@ impl CliClient {
                     reliable.lock().unwrap().process_recv(&msg);
                     match msg {
                         SignalingMessage::Answer { answer_sdp, .. } => {
-                            info!("Received answer from agent, setting remote description");
-                            let answer = SessionDescription::parse(SdpType::Answer, &answer_sdp)?;
-                            peer_connection.set_remote_description(answer).await?;
-                            info!("WebRTC handshake completed for session {}", session_id);
-                            answer_received = true;
+                            if answer_received {
+                                debug!("Duplicate answer (agent retransmit), ignoring");
+                            } else {
+                                info!("Received answer from agent, setting remote description");
+                                let answer = SessionDescription::parse(SdpType::Answer, &answer_sdp)?;
+                                peer_connection.set_remote_description(answer).await?;
+                                info!("WebRTC handshake completed for session {}", session_id);
+                                answer_received = true;
+                                // ACK the answer promptly so the agent stops
+                                // retransmitting it while we wait for ICE to
+                                // connect.  Lock is dropped before .await.
+                                let ack_seq = reliable.lock().unwrap().last_recv_seq();
+                                if let Some(seq) = ack_seq {
+                                    let mut ack_msg = SignalingMessage::new_ack(session_id.clone(), seq);
+                                    {
+                                        let mut guard = reliable.lock().unwrap();
+                                        guard.prepare_send(&mut ack_msg, false);
+                                    }
+                                    let _ = dtls_client.send(&ack_msg).await;
+                                }
+                            }
                         }
                         SignalingMessage::Candidate { candidate, .. } => {
                             if candidate.len() > 80 {
