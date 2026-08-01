@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Cross-platform GUI manager for rport port forwarding"
 license = "MIT"
+publish = false
 
 [dependencies]
 rport = { path = "../rport" }
