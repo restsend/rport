@@ -110,17 +110,8 @@ impl SignalingMessage {
     pub fn new_answer(session_id: String, answer_sdp: String) -> Self {
         Self::Answer { session_id, answer_sdp, seq: None, ack: None }
     }
-    pub fn new_candidate(session_id: String, candidate: String) -> Self {
-        Self::Candidate { session_id, candidate, seq: None, ack: None }
-    }
-    pub fn new_end_of_candidates(session_id: String) -> Self {
-        Self::EndOfCandidates { session_id, seq: None, ack: None }
-    }
     pub fn new_error(session_id: String, reason: String) -> Self {
         Self::Error { session_id, reason, seq: None, ack: None }
-    }
-    pub fn new_ack(session_id: String, ack_seq: u64) -> Self {
-        Self::Ack { session_id, ack_seq, seq: None, ack: None }
     }
 }
 
