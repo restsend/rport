@@ -1,6 +1,6 @@
 [package]
 name = "rport-server"
-version = "0.1.21"
+version = "0.1.22"
 edition = "2021"
 description = "P2P Signaling server for rport"
 license = "MIT"
@@ -23,7 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
-rustrtc = "0.3.110"
+rustrtc = "0.3.117"
 async-stream = "0.3.6"
 tower-http = { version = "0.6.7", features = ["cors", "trace"] }
 clap = { version = "4.5.53", features = ["derive"] }
