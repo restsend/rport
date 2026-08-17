@@ -63,7 +63,7 @@ pub async fn forward_stream_to_webrtc<R, W>(
     data_channel: Arc<DataChannel>,
     connect_timeout: Option<u32>,
     stats: Option<Arc<ForwardStats>>,
-    label: String,
+    _label: String,
     mut input: R,
     mut output: W,
     mut remote_msg_rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
@@ -127,47 +127,6 @@ where
         return Err(anyhow!("Data channel open timeout"));
     }
     debug!("Data channel is open, starting forwarding");
-
-    // Periodic link-stats logger: every 10s prints SCTP-level throughput,
-    // smoothed RTT, retransmission timeout and retransmit count for this
-    // connection, plus app-level bytes when a ForwardStats is attached.
-    {
-        let pc_stats = peer_connection.clone();
-        let app_stats = stats.clone();
-        let stats_label = label.clone();
-        tokio::spawn(async move {
-            let mut prev_sent = 0u64;
-            let mut prev_recv = 0u64;
-            loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                let s = match pc_stats.sctp_link_stats() {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let d_sent = s.bytes_sent.saturating_sub(prev_sent);
-                let d_recv = s.bytes_received.saturating_sub(prev_recv);
-                prev_sent = s.bytes_sent;
-                prev_recv = s.bytes_received;
-                let up_kbps = d_sent as f64 / 10.0 / 1024.0;
-                let dn_kbps = d_recv as f64 / 10.0 / 1024.0;
-                let srtt_ms = s.srtt.as_secs_f64() * 1000.0;
-                let rto_ms = s.rto.as_secs_f64() * 1000.0;
-                let app = app_stats.as_ref().map(|a| {
-                    let bs = a.bytes_sent.load(Ordering::Relaxed);
-                    let br = a.bytes_recv.load(Ordering::Relaxed);
-                    format!(" | app: {}B↑ {}B↓", bs, br)
-                }).unwrap_or_default();
-                info!(
-                    "[link] {} | sctp sent {:.1}KB ({:.1}KB/s) recv {:.1}KB ({:.1}KB/s) | srtt {:.1}ms rto {:.0}ms retrans {} dur {:.0}s{}",
-                    stats_label,
-                    s.bytes_sent as f64 / 1024.0, up_kbps,
-                    s.bytes_received as f64 / 1024.0, dn_kbps,
-                    srtt_ms, rto_ms, s.retransmissions, s.duration.as_secs(),
-                    app,
-                );
-            }
-        });
-    }
 
     const DISCONNECT_GRACE: Duration = Duration::from_secs(15);
     let pc_monitor = peer_connection.clone();
@@ -554,10 +513,25 @@ impl CliClient {
         peer_connection.set_local_description(offer)?;
 
         // Wait for all ICE candidates before sending offer so that
-        // old HTTP/SSE agents (which ignore trickle ICE) get all candidates in the SDP
+        // old HTTP/SSE agents (which ignore trickle ICE) get all candidates in the SDP.
+        // Bounded: a slow/hung UPnP or STUN gather must not block the offer
+        // forever — the trickle loop below still forwards candidates as they
+        // arrive, so ICE can complete after the offer goes out.
         if self.wait_candidates {
             info!("Waiting for ICE gathering to complete (--wait-candidates)");
-            peer_connection.wait_for_gathering_complete().await;
+            if tokio::time::timeout(Duration::from_secs(5), peer_connection.wait_for_gathering_complete()).await.is_err() {
+                warn!("ICE gathering not complete after 5s, sending offer anyway (trickle will deliver remaining candidates)");
+            }
+        } else if self.webrtc_config.enable_upnp {
+            // UPnP gathering runs after STUN/TURN in rustrtc's gather(), so
+            // without waiting the relay candidate is ready first and the
+            // direct UPnP srflx path loses the ICE race. Give the UPnP
+            // candidate a short bounded head-start (300ms) so the direct
+            // path can win when the router responds promptly.
+            info!("Waiting briefly for UPnP candidates (max 300ms) before sending offer");
+            if tokio::time::timeout(Duration::from_millis(300), peer_connection.wait_for_gathering_complete()).await.is_err() {
+                debug!("UPnP gathering not complete after 300ms, sending offer anyway (trickle will deliver remaining candidates)");
+            }
         }
 
         let offer_sdp = peer_connection.local_description()
