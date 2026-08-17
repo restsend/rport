@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use rustrtc::transports::sctp::{DataChannelConfig, DataChannelEvent};
 use rustrtc::{IceCandidate, IceGatheringState, PeerConnection, RtcConfiguration, SessionDescription, SdpType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -81,10 +81,11 @@ async fn test_webrtc_e2e_data_flow() {
 
     let _relay_agent_to_client = {
         let mut agent_rx = agent_session.data_rx;
+        let mut agent_buf = BytesMut::new();
         let c_tx = client_tx.clone();
         tokio::spawn(async move {
             loop {
-                match recv_message(&mut agent_rx).await {
+                match recv_message(&mut agent_rx, &mut agent_buf).await {
                     Ok(msg) => {
                         tracing::debug!("Relay agent->client: {:?}", msg);
                         if send_message(&c_tx, &msg).await.is_err() {
@@ -99,10 +100,11 @@ async fn test_webrtc_e2e_data_flow() {
 
     let _relay_client_to_agent = {
         let mut client_rx = client_session.data_rx;
+        let mut client_buf = BytesMut::new();
         let a_tx = agent_tx.clone();
         tokio::spawn(async move {
             loop {
-                match recv_message(&mut client_rx).await {
+                match recv_message(&mut client_rx, &mut client_buf).await {
                     Ok(msg) => {
                         tracing::debug!("Relay client->agent: {:?}", msg);
                         if send_message(&a_tx, &msg).await.is_err() {
@@ -296,10 +298,11 @@ async fn test_webrtc_e2e_data_flow() {
         let pc = agent_pc.clone();
         let dtls_tx = agent_dtls.dtls.clone();
         let mut data_rx = agent_dtls.data_rx;
+        let mut data_buf = BytesMut::new();
         let sid = session_id.clone();
         tokio::spawn(async move {
             loop {
-                let msg = match recv_message(&mut data_rx).await {
+                let msg = match recv_message(&mut data_rx, &mut data_buf).await {
                     Ok(m) => m,
                     Err(_) => break,
                 };
@@ -356,8 +359,9 @@ async fn test_webrtc_e2e_data_flow() {
 
     // Client processes incoming messages until answer received
     let mut client_rx = client_dtls.data_rx;
+    let mut client_buf = BytesMut::new();
     loop {
-        let msg = recv_message(&mut client_rx).await.unwrap();
+        let msg = recv_message(&mut client_rx, &mut client_buf).await.unwrap();
         match msg {
             SignalingMessage::Answer { answer_sdp, .. } => {
                 tracing::info!("Client received answer in {:?}", handshake_start.elapsed());

@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use rustrtc::transports::dtls::{DtlsState, DtlsTransport, Certificate, generate_certificate, fingerprint};
 use rustrtc::transports::ice::conn::IceConn;
 use rustrtc::transports::ice::IceSocketWrapper;
@@ -107,16 +107,37 @@ pub fn encode_message(msg: &SignalingMessage) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-pub async fn recv_message(rx: &mut mpsc::UnboundedReceiver<Bytes>) -> Result<SignalingMessage> {
-    let data = rx.recv().await.ok_or_else(|| anyhow!("DTLS channel closed"))?;
-    if data.len() < 4 {
-        return Err(anyhow!("Frame too short"));
+/// Maximum size of a signaling frame the reassembler is willing to buffer.
+/// Real messages (offers/answers with SDP, candidates, acks) are at most a few
+/// KB; anything larger is garbage or a peer bug, so error out instead of
+/// buffering a bogus length prefix forever.
+const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
+
+/// Read one complete signaling frame from the DTLS record stream.
+///
+/// rustrtc delivers each DTLS ApplicationData record as one `Bytes`. Since
+/// 0.3.121, oversized messages are split by the record layer into several
+/// MTU-safe records (one UDP datagram each) to avoid IP fragmentation through
+/// NATs. `buf` holds the partially-received frame across calls so a message
+/// arriving as multiple records is reassembled before parsing.
+pub async fn recv_message(
+    rx: &mut mpsc::UnboundedReceiver<Bytes>,
+    buf: &mut BytesMut,
+) -> Result<SignalingMessage> {
+    loop {
+        if buf.len() >= 4 {
+            let msg_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if msg_len > MAX_FRAME_SIZE {
+                return Err(anyhow!("Frame too large: {} bytes", msg_len));
+            }
+            if buf.len() >= 4 + msg_len {
+                let frame = buf.split_to(4 + msg_len);
+                return Ok(serde_json::from_slice(&frame[4..])?);
+            }
+        }
+        let data = rx.recv().await.ok_or_else(|| anyhow!("DTLS channel closed"))?;
+        buf.extend_from_slice(&data);
     }
-    let msg_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if data.len() < 4 + msg_len {
-        return Err(anyhow!("Incomplete frame"));
-    }
-    Ok(serde_json::from_slice(&data[4..4 + msg_len])?)
 }
 
 impl SignalingMessage {
@@ -163,6 +184,8 @@ fn create_ice_conn(
 pub struct DtlsClient {
     pub dtls: Arc<DtlsTransport>,
     pub data_rx: mpsc::UnboundedReceiver<Bytes>,
+    /// Reassembly buffer for messages split across multiple DTLS records.
+    recv_buf: BytesMut,
     _reader: tokio::task::JoinHandle<()>,
 }
 
@@ -228,7 +251,7 @@ impl DtlsClient {
             debug!("DTLS client state -> {}", *state_rx.borrow());
         }
         info!("DTLS connected to {}", remote_addr);
-        Ok(Self { dtls, data_rx, _reader: reader })
+        Ok(Self { dtls, data_rx, recv_buf: BytesMut::new(), _reader: reader })
     }
 
     pub async fn send(&self, msg: &SignalingMessage) -> Result<()> {
@@ -236,7 +259,7 @@ impl DtlsClient {
     }
 
     pub async fn recv(&mut self) -> Result<SignalingMessage> {
-        recv_message(&mut self.data_rx).await
+        recv_message(&mut self.data_rx, &mut self.recv_buf).await
     }
 
     pub fn close(&self) {
@@ -378,7 +401,8 @@ mod tests {
             Some(vec![Target { host: Some("127.0.0.1".to_string()), port: 22 }]),
         )).await.unwrap();
 
-        let msg = tokio::time::timeout(Duration::from_secs(5), recv_message(&mut agent_session.data_rx)).await
+        let mut agent_buf = BytesMut::new();
+        let msg = tokio::time::timeout(Duration::from_secs(5), recv_message(&mut agent_session.data_rx, &mut agent_buf)).await
             .expect("Timeout receiving offer").unwrap();
         match msg {
             SignalingMessage::Offer { session_id: sid, offer_sdp, targets, .. } => {
@@ -410,5 +434,93 @@ mod tests {
         client.close();
         agent_session.dtls.close();
         tracing::info!("DTLS signaling roundtrip test passed!");
+    }
+
+    #[tokio::test]
+    async fn test_recv_message_reassembles_fragmented_frame() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let msg = SignalingMessage::new_offer(
+            "sess".into(),
+            "agent".into(),
+            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n".to_string(),
+            None,
+        );
+        let encoded = encode_message(&msg).unwrap();
+
+        // Feed the frame in many small chunks, as if it arrived split across
+        // several DTLS records (rustrtc >= 0.3.121 fragments >1200-byte
+        // messages into MTU-safe records).
+        let chunks: Vec<&[u8]> = encoded.chunks(7).collect();
+        assert!(chunks.len() > 1, "test payload must span multiple chunks");
+        for c in chunks {
+            tx.send(Bytes::copy_from_slice(c)).unwrap();
+        }
+
+        let mut buf = BytesMut::new();
+        let got = recv_message(&mut rx, &mut buf).await.unwrap();
+        match got {
+            SignalingMessage::Offer { session_id, offer_sdp, .. } => {
+                assert_eq!(session_id, "sess");
+                assert!(offer_sdp.contains("v=0"));
+            }
+            other => panic!("Expected offer, got {:?}", other),
+        }
+    }
+
+    /// Reproduction of the production bug: a signaling offer with an SDP
+    /// larger than one MTU-sized DTLS record. Before rustrtc record
+    /// fragmentation + receive-side reassembly, this message was IP-fragmented
+    /// and silently dropped by NATs; the peer only saw the trailing
+    /// EndOfCandidates/Candidate records and the whole session failed.
+    #[tokio::test]
+    async fn test_dtls_signaling_large_message_fragmentation() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .try_init();
+
+        let mut agent = DtlsAgent::bind("127.0.0.1:0", None).await.unwrap();
+        let agent_addr = agent.local_addr().unwrap().to_string();
+
+        let client = DtlsClient::connect(&agent_addr, None).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut agent_session = agent.accept().await.expect("Agent should accept connection");
+
+        // SDP larger than MAX_APP_DATA_RECORD_SIZE (1200) — would previously
+        // be IP-fragmented and dropped through a NAT.
+        let big_sdp = format!(
+            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=long-payload:{}\r\n",
+            "x".repeat(3000)
+        );
+        assert!(big_sdp.len() > 1200);
+        let session_id = "large-session-1".to_string();
+        client
+            .send(&SignalingMessage::new_offer(
+                session_id.clone(),
+                "test-agent".to_string(),
+                big_sdp.clone(),
+                Some(vec![Target { host: Some("127.0.0.1".to_string()), port: 22 }]),
+            ))
+            .await
+            .unwrap();
+
+        let mut agent_buf = BytesMut::new();
+        let msg = tokio::time::timeout(
+            Duration::from_secs(5),
+            recv_message(&mut agent_session.data_rx, &mut agent_buf),
+        )
+        .await
+        .expect("Timeout receiving fragmented offer")
+        .unwrap();
+        match msg {
+            SignalingMessage::Offer { session_id: sid, offer_sdp, .. } => {
+                assert_eq!(sid, session_id);
+                assert_eq!(offer_sdp, big_sdp);
+            }
+            other => panic!("Expected offer, got {:?}", other),
+        }
+
+        client.close();
+        agent_session.dtls.close();
     }
 }

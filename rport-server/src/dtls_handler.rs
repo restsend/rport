@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use rustrtc::transports::dtls::{self, DtlsState, DtlsTransport, Certificate};
 use rustrtc::transports::ice::conn::IceConn;
 use rustrtc::transports::ice::IceSocketWrapper;
@@ -124,16 +124,30 @@ fn encode_msg(msg: &SignalingMessage) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-async fn recv_msg(rx: &mut mpsc::UnboundedReceiver<Bytes>) -> Result<SignalingMessage> {
-    let data = rx.recv().await.ok_or_else(|| anyhow!("DTLS channel closed"))?;
-    if data.len() < 4 {
-        return Err(anyhow!("Frame too short"));
+/// Maximum size of a signaling frame the reassembler is willing to buffer.
+const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
+
+/// Read one complete signaling frame from the DTLS record stream, reassembling
+/// messages that rustrtc (>=0.3.121) split into several MTU-safe records.
+/// `buf` carries the partial frame across calls.
+async fn recv_msg(
+    rx: &mut mpsc::UnboundedReceiver<Bytes>,
+    buf: &mut BytesMut,
+) -> Result<SignalingMessage> {
+    loop {
+        if buf.len() >= 4 {
+            let msg_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if msg_len > MAX_FRAME_SIZE {
+                return Err(anyhow!("Frame too large: {} bytes", msg_len));
+            }
+            if buf.len() >= 4 + msg_len {
+                let frame = buf.split_to(4 + msg_len);
+                return Ok(serde_json::from_slice(&frame[4..])?);
+            }
+        }
+        let data = rx.recv().await.ok_or_else(|| anyhow!("DTLS channel closed"))?;
+        buf.extend_from_slice(&data);
     }
-    let msg_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if data.len() < 4 + msg_len {
-        return Err(anyhow!("Incomplete frame"));
-    }
-    Ok(serde_json::from_slice(&data[4..4 + msg_len])?)
 }
 
 async fn send_msg(dtls: &DtlsTransport, msg: &SignalingMessage) -> Result<()> {
@@ -298,8 +312,9 @@ impl DtlsHandler {
                         let mut data_rx = data_rx;
 
                         // Loop to handle GetIceServers before Register/Offer (backward compatible)
+                        let mut first_buf = BytesMut::new();
                         let first_msg = loop {
-                            let msg = match recv_msg(&mut data_rx).await {
+                            let msg = match recv_msg(&mut data_rx, &mut first_buf).await {
                                 Ok(m) => m,
                                 Err(e) => {
                                     warn!("Failed to read first message from {}: {}", addr, e);
@@ -484,7 +499,8 @@ impl DtlsHandler {
         };
 
         loop {
-            let msg = match tokio::time::timeout(idle_timeout, recv_msg(data_rx)).await {
+            let mut recv_buf = BytesMut::new();
+            let msg = match tokio::time::timeout(idle_timeout, recv_msg(data_rx, &mut recv_buf)).await {
                 Ok(Ok(m)) => m,
                 Ok(Err(e)) => {
                     warn!("Agent '{}' recv error: {}", agent_id, e);
@@ -571,9 +587,10 @@ impl DtlsHandler {
         agent_id: String,
     ) {
         loop {
+            let mut recv_buf = BytesMut::new();
             let msg = match tokio::time::timeout(
                 tokio::time::Duration::from_secs(60),
-                recv_msg(data_rx),
+                recv_msg(data_rx, &mut recv_buf),
             ).await {
                 Ok(Ok(m)) => m,
                 Ok(Err(e)) => {
@@ -651,9 +668,10 @@ impl DtlsHandler {
     ) {
         let http_agent = Self::find_http_agent(&state, &agent_id).await;
 
+        let mut recv_buf = BytesMut::new();
         loop {
             tokio::select! {
-                msg = recv_msg(data_rx) => {
+                msg = recv_msg(data_rx, &mut recv_buf) => {
                     match msg {
                         Ok(SignalingMessage::Candidate { session_id: sid, candidate, seq, ack }) => {
                             if let Some(ref agent) = http_agent {

@@ -1,7 +1,7 @@
 use crate::{
     acl::Acl,
     config::{IceServerConfig, RportConfig},
-    dtls_signaling::{DtlsClient, SignalingMessage, Target, send_message, recv_message},
+    dtls_signaling::{DtlsClient, SignalingMessage, Target, send_message},
     reliable::ReliableSession,
     webrtc_config::WebRTCConfig,
 };
@@ -171,7 +171,7 @@ impl Agent {
                     }
                     msg_result = tokio::time::timeout(
                         Duration::from_secs(45),
-                        recv_message(&mut client.data_rx),
+                        client.recv(),
                     ) => {
                         match msg_result {
                             Ok(Ok(m)) => m,
