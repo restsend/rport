@@ -586,10 +586,29 @@ impl DtlsHandler {
         session_id: String,
         agent_id: String,
     ) {
+        // Keepalive: server pings client every 15s so the idle timeout below
+        // only fires for genuinely-dead signaling links (the client may be
+        // mid-handshake waiting for its data channel to open, during which it
+        // sends no signaling messages).
+        let ping_interval = Duration::from_secs(15);
+        let idle_timeout = Duration::from_secs(45);
+
+        let ping_handle = {
+            let dtls = dtls.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(ping_interval).await;
+                    if send_msg(&dtls, &SignalingMessage::Ping).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
         loop {
             let mut recv_buf = BytesMut::new();
             let msg = match tokio::time::timeout(
-                tokio::time::Duration::from_secs(60),
+                idle_timeout,
                 recv_msg(data_rx, &mut recv_buf),
             ).await {
                 Ok(Ok(m)) => m,
@@ -639,6 +658,8 @@ impl DtlsHandler {
             }
         }
 
+        ping_handle.abort();
+        let _ = ping_handle.await;
         sessions.write().await.remove(&session_id);
         info!("Client session {} ended", session_id);
     }

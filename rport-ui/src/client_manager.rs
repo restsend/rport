@@ -122,12 +122,12 @@ impl ManagedClient {
                                         let status_tx = status_tx.clone();
                                         tokio::spawn(async move {
                                             match client.establish_webrtc(&host, port).await {
-                                                Ok((pc, dc, remote_rx)) => {
+                                                Ok((pc, dc, remote_rx, signaling_done)) => {
                                                     status_tx.send(ClientStatus::Connected).ok();
                                                     if let Err(e) = forward_stream_to_webrtc(
                                                         pc, dc, Some(30), Some(stats),
                                                         format!("{}:{}", host, port),
-                                                        reader, writer, remote_rx,
+                                                        reader, writer, remote_rx, signaling_done,
                                                     ).await {
                                                         tracing::error!("Forward error: {}", e);
                                                     }

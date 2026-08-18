@@ -67,6 +67,7 @@ pub async fn forward_stream_to_webrtc<R, W>(
     mut input: R,
     mut output: W,
     mut remote_msg_rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    signaling_done: tokio_util::sync::CancellationToken,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -124,6 +125,7 @@ where
     let connect_timeout = connect_timeout.unwrap_or(30);
     debug!("Waiting for data channel to open (timeout: {}s)...", connect_timeout);
     if let Err(_) = tokio::time::timeout(Duration::from_secs(connect_timeout.into()), open_rx).await {
+        signaling_done.cancel();
         return Err(anyhow!("Data channel open timeout"));
     }
     debug!("Data channel is open, starting forwarding");
@@ -249,6 +251,9 @@ where
         }
         _ = &mut output_task => { tracing::debug!("forward_stream_to_webrtc: output closed"); }
     }
+    // Session is over — stop answering signaling keepalives so the server
+    // reclaims the DTLS session instead of keeping it alive forever.
+    signaling_done.cancel();
     Ok(())
 }
 
@@ -297,11 +302,11 @@ impl CliClient {
         target_port: u16,
     ) -> Result<()> {
         info!("ProxyCommand: agent '{}' target {}:{}", self.agent_id, target_host, target_port);
-        let (pc, dc, remote_rx) = self.establish_webrtc(target_host, target_port).await?;
+        let (pc, dc, remote_rx, signaling_done) = self.establish_webrtc(target_host, target_port).await?;
         forward_stream_to_webrtc(
             pc, dc, connect_timeout, None,
             format!("proxy -> {}:{}", target_host, target_port),
-            tokio::io::stdin(), tokio::io::stdout(), remote_rx,
+            tokio::io::stdin(), tokio::io::stdout(), remote_rx, signaling_done,
         ).await
     }
 
@@ -359,11 +364,11 @@ impl CliClient {
                             let host_clone = host.clone();
                             tokio::spawn(async move {
                                 match client.establish_webrtc(&host_clone, port).await {
-                                    Ok((pc, dc, remote_rx)) => {
+                                    Ok((pc, dc, remote_rx, signaling_done)) => {
                                         if let Err(e) = forward_stream_to_webrtc(
                                             pc, dc, timeout, Some(stats),
                                             format!("localhost:{} -> {}:{}", local_port, host_clone, port),
-                                            reader, writer, remote_rx,
+                                            reader, writer, remote_rx, signaling_done,
                                         ).await {
                                             error!("Forwarding error: {}", e);
                                         }
@@ -428,7 +433,12 @@ impl CliClient {
         &self,
         target_host: &str,
         target_port: u16,
-    ) -> Result<(Arc<PeerConnection>, Arc<DataChannel>, tokio::sync::mpsc::UnboundedReceiver<Bytes>)> {
+    ) -> Result<(
+        Arc<PeerConnection>,
+        Arc<DataChannel>,
+        tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+        tokio_util::sync::CancellationToken,
+    )> {
         // Try GetIceServers. On timeout/error the DTLS connection is dead
         // (old server dropped us), so reconnect without it.
         let (mut dtls_client, extra_ice_servers) =
@@ -679,6 +689,9 @@ impl CliClient {
                             dtls_client.close();
                             return Err(anyhow!("Agent rejected offer: {}", reason));
                         }
+                        SignalingMessage::Ping => {
+                            let _ = dtls_client.send(&SignalingMessage::Pong).await;
+                        }
                         other => {
                             debug!("Unexpected message during signaling: {:?}", other);
                             continue;
@@ -734,7 +747,38 @@ impl CliClient {
             let _ = dtls_client.send(&ack_msg).await;
         }
 
-        Ok((peer_connection, data_channel, remote_msg_rx))
+        // Keep the signaling DTLS connection to the server alive for the
+        // lifetime of this session. The server pings clients every 15s and
+        // idle-times-out sessions that stop responding; during the
+        // data-channel-open wait the client sends no signaling of its own, so
+        // without a responder the server would tear the session down before
+        // WebRTC has finished connecting.
+        let signaling_done = tokio_util::sync::CancellationToken::new();
+        {
+            let mut dtls_client = dtls_client;
+            let done = signaling_done.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = done.cancelled() => {
+                            dtls_client.close();
+                            break;
+                        }
+                        msg = dtls_client.recv() => {
+                            match msg {
+                                Ok(SignalingMessage::Ping) => {
+                                    let _ = dtls_client.send(&SignalingMessage::Pong).await;
+                                }
+                                Ok(_) => {}
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        Ok((peer_connection, data_channel, remote_msg_rx, signaling_done))
     }
 }
 
