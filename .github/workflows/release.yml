@@ -1,0 +1,119 @@
+name: Release musl binary
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C target-feature=+crt-static"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            cc: musl-gcc
+            linker: musl-gcc
+            strip: strip
+            cross_image: ""
+          - target: aarch64-unknown-linux-musl
+            cc: aarch64-linux-musl-gcc
+            linker: aarch64-linux-musl-gcc
+            strip: aarch64-linux-musl-strip
+            cross_image: ghcr.io/cross-rs/aarch64-unknown-linux-musl:main
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry / target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target/${{ matrix.target }}
+          key: musl-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+
+      - name: Install musl cross toolchain
+        run: |
+          set -euxo pipefail
+          if [ -z "${{ matrix.cross_image }}" ]; then
+            sudo apt-get update
+            sudo apt-get install -y musl-tools
+          else
+            # Pull the cross-rs aarch64-musl toolchain from ghcr.io (GitHub's
+            # CDN — fast on runners, unlike musl.cc which throttles) and overlay
+            # its /usr/local onto the runner. Extracting to the same absolute
+            # path keeps the gcc driver's internal libexec/sysroot paths valid.
+            docker pull "${{ matrix.cross_image }}"
+            cid=$(docker create "${{ matrix.cross_image }}")
+            docker cp "$cid:/usr/local" /tmp/xlocal
+            docker rm "$cid"
+            sudo cp -a /tmp/xlocal/. /usr/local/
+            ${{ matrix.cc }} --version
+          fi
+
+      - name: Configure cargo linker
+        run: |
+          key="CARGO_TARGET_$(echo "${{ matrix.target }}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')_LINKER"
+          echo "$key=${{ matrix.linker }}" >> "$GITHUB_ENV"
+          echo "CC=${{ matrix.cc }}" >> "$GITHUB_ENV"
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p rport -p rport-server
+
+      - name: Strip and verify fully static
+        run: |
+          for name in rport rport-server; do
+            bin="target/${{ matrix.target }}/release/$name"
+            ${{ matrix.strip }} "$bin"
+            file "$bin"
+            case "$(file "$bin")" in
+              *"static-pie linked"*|*"statically linked"*) ;;
+              *) echo "ERROR: $name is not fully static"; exit 1 ;;
+            esac
+          done
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          for name in rport rport-server; do
+            cp "$name" "${name}-${{ matrix.target }}"
+            sha256sum "${name}-${{ matrix.target }}" > "${name}-${{ matrix.target }}.sha256"
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rport-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/rport-${{ matrix.target }}
+            target/${{ matrix.target }}/release/rport-${{ matrix.target }}.sha256
+            target/${{ matrix.target }}/release/rport-server-${{ matrix.target }}
+            target/${{ matrix.target }}/release/rport-server-${{ matrix.target }}.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
