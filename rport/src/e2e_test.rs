@@ -181,6 +181,7 @@ async fn test_webrtc_e2e_data_flow() {
                 DataChannelEvent::Message(data) => {
                     let _ = tcp_msg_tx.send(Bytes::from(data));
                 }
+                DataChannelEvent::BufferedAmountLow(_) => {}
                 DataChannelEvent::Close => {
                     tracing::info!("Agent data channel closed");
                     break;

@@ -767,3 +767,151 @@ impl DtlsHandler {
         info!("Bridge session {} ended", session_id);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_offer() -> SignalingMessage {
+        SignalingMessage::new_offer(
+            "sess-1".to_string(),
+            "agent-1".to_string(),
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1".to_string(),
+            Some(vec![Target {
+                host: Some("127.0.0.1".to_string()),
+                port: 22,
+            }]),
+        )
+    }
+
+    #[test]
+    fn test_encode_msg_frame_layout() {
+        let msg = sample_offer();
+        let buf = encode_msg(&msg).unwrap();
+        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        assert_eq!(len, buf.len() - 4);
+        // Payload must deserialize back to the same message type
+        let decoded: SignalingMessage = serde_json::from_slice(&buf[4..]).unwrap();
+        assert!(matches!(decoded, SignalingMessage::Offer { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_recv_msg_roundtrip() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Bytes::from(encode_msg(&sample_offer()).unwrap())).unwrap();
+        let mut buf = BytesMut::new();
+        let msg = recv_msg(&mut rx, &mut buf).await.unwrap();
+        match msg {
+            SignalingMessage::Offer {
+                session_id,
+                agent_id,
+                offer_sdp: _,
+                targets,
+                ..
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(agent_id, "agent-1");
+                assert_eq!(targets.unwrap()[0].port, 22);
+            }
+            other => panic!("expected Offer, got {:?}", other),
+        }
+        // Buffer must be fully consumed
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_recv_msg_reassembles_fragments() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let data = encode_msg(&sample_offer()).unwrap();
+        let (head, tail) = data.split_at(data.len() / 2);
+        tx.send(Bytes::copy_from_slice(head)).unwrap();
+        tx.send(Bytes::copy_from_slice(tail)).unwrap();
+        let mut buf = BytesMut::new();
+        let msg = recv_msg(&mut rx, &mut buf).await.unwrap();
+        assert!(matches!(msg, SignalingMessage::Offer { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_recv_msg_parses_two_frames_in_one_chunk() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut both = encode_msg(&SignalingMessage::Ping).unwrap();
+        both.extend_from_slice(&encode_msg(&SignalingMessage::Pong).unwrap());
+        tx.send(Bytes::from(both)).unwrap();
+        let mut buf = BytesMut::new();
+        assert!(matches!(recv_msg(&mut rx, &mut buf).await.unwrap(), SignalingMessage::Ping));
+        assert!(matches!(recv_msg(&mut rx, &mut buf).await.unwrap(), SignalingMessage::Pong));
+    }
+
+    #[tokio::test]
+    async fn test_recv_msg_rejects_oversized_frame() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut frame = (MAX_FRAME_SIZE as u32 + 1).to_be_bytes().to_vec();
+        frame.extend_from_slice(b"junk");
+        tx.send(Bytes::from(frame)).unwrap();
+        let mut buf = BytesMut::new();
+        assert!(recv_msg(&mut rx, &mut buf).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_recv_msg_fails_when_channel_closed() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+        drop(tx);
+        let mut buf = BytesMut::new();
+        assert!(recv_msg(&mut rx, &mut buf).await.is_err());
+    }
+
+    #[test]
+    fn test_signaling_message_serde_tags() {
+        let cases = [
+            (
+                SignalingMessage::Register {
+                    token: "t".into(),
+                    id: "i".into(),
+                },
+                "register",
+            ),
+            (
+                SignalingMessage::Answer {
+                    session_id: "s".into(),
+                    answer_sdp: "a".into(),
+                    seq: None,
+                    ack: None,
+                },
+                "answer",
+            ),
+            (SignalingMessage::GetIceServers, "get-ice-servers"),
+            (SignalingMessage::Ping, "ping"),
+        ];
+        for (msg, tag) in cases {
+            let json = serde_json::to_value(&msg).unwrap();
+            assert_eq!(json["type"], tag, "tag mismatch for {}", tag);
+            let round: SignalingMessage = serde_json::from_value(json).unwrap();
+            assert_eq!(serde_json::to_value(&round).unwrap()["type"], tag);
+        }
+    }
+
+    #[test]
+    fn test_ack_serde_roundtrip_with_seq() {
+        let ack = SignalingMessage::Ack {
+            session_id: "s".into(),
+            ack_seq: 7,
+            seq: Some(3),
+            ack: Some(2),
+        };
+        let json = serde_json::to_string(&ack).unwrap();
+        match serde_json::from_str::<SignalingMessage>(&json).unwrap() {
+            SignalingMessage::Ack {
+                session_id,
+                ack_seq,
+                seq,
+                ack,
+            } => {
+                assert_eq!(session_id, "s");
+                assert_eq!(ack_seq, 7);
+                assert_eq!(seq, Some(3));
+                assert_eq!(ack, Some(2));
+            }
+            other => panic!("expected Ack, got {:?}", other),
+        }
+    }
+}

@@ -111,6 +111,9 @@ where
                     }
                     let _ = msg_tx.send(data);
                 }
+                DataChannelEvent::BufferedAmountLow(_) => {
+                    // Flow-control hint (W3C bufferedamountlow); nothing to do here.
+                }
                 DataChannelEvent::Close => {
                     if let Some(reason) = pc_disc.disconnect_reason() {
                         tracing::warn!("Data channel closed (reason: {})", reason);

@@ -148,7 +148,6 @@ pub fn parse_allow_rules(rules: &[String]) -> Result<Option<Acl>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::IpAddr;
 
     #[test]
     fn test_allow_port() {

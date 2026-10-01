@@ -76,3 +76,125 @@ impl fmt::Display for ClientAddr {
         write!(f, "{}", self.addr)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn extract(req: http::Request<()>) -> ClientAddr {
+        let (mut parts, _) = req.into_parts();
+        ClientAddr::from_request_parts(&mut parts, &())
+            .await
+            .expect("extract ClientAddr")
+    }
+
+    #[tokio::test]
+    async fn test_plain_http_not_secure() {
+        let addr = extract(
+            http::Request::builder()
+                .uri("http://example.com/rport/connect")
+                .body(())
+                .unwrap(),
+        )
+        .await;
+        assert!(!addr.is_secure);
+        // No ConnectInfo extension -> fallback 0.0.0.0:0
+        assert_eq!(addr.to_string(), "0.0.0.0:0");
+    }
+
+    #[tokio::test]
+    async fn test_wss_scheme_is_secure() {
+        let addr = extract(
+            http::Request::builder()
+                .uri("wss://example.com/rport/connect")
+                .body(())
+                .unwrap(),
+        )
+        .await;
+        assert!(addr.is_secure);
+    }
+
+    #[tokio::test]
+    async fn test_https_scheme_is_secure() {
+        let addr = extract(
+            http::Request::builder()
+                .uri("https://example.com/rport/connect")
+                .body(())
+                .unwrap(),
+        )
+        .await;
+        assert!(addr.is_secure);
+    }
+
+    #[tokio::test]
+    async fn test_forwarded_proto_header_marks_secure() {
+        let addr = extract(
+            http::Request::builder()
+                .uri("http://example.com/")
+                .header("x-forwarded-proto", "https")
+                .body(())
+                .unwrap(),
+        )
+        .await;
+        assert!(addr.is_secure);
+    }
+
+    #[tokio::test]
+    async fn test_x_forwarded_for_first_ip_wins() {
+        let addr = extract(
+            http::Request::builder()
+                .uri("http://example.com/")
+                .header("x-forwarded-for", "203.0.113.7, 10.0.0.1")
+                .extension(ConnectInfo(
+                    "192.168.1.5:5000".parse::<SocketAddr>().unwrap(),
+                ))
+                .body(())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(addr.ip().to_string(), "203.0.113.7");
+        // Port from ConnectInfo is preserved
+        assert_eq!(addr.addr.port(), 5000);
+    }
+
+    #[tokio::test]
+    async fn test_x_client_ip_has_priority() {
+        let addr = extract(
+            http::Request::builder()
+                .uri("http://example.com/")
+                .header("x-client-ip", "198.51.100.9")
+                .header("x-forwarded-for", "203.0.113.7")
+                .header("x-real-ip", "192.0.2.1")
+                .extension(ConnectInfo(
+                    "192.168.1.5:5000".parse::<SocketAddr>().unwrap(),
+                ))
+                .body(())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(addr.ip().to_string(), "198.51.100.9");
+    }
+
+    #[tokio::test]
+    async fn test_connect_info_fallback_without_headers() {
+        let addr = extract(
+            http::Request::builder()
+                .uri("http://example.com/")
+                .extension(ConnectInfo(
+                    "192.168.1.5:5000".parse::<SocketAddr>().unwrap(),
+                ))
+                .body(())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(addr.to_string(), "192.168.1.5:5000");
+    }
+
+    #[test]
+    fn test_new_defaults_to_insecure() {
+        let addr = ClientAddr::new("10.1.2.3:8080".parse().unwrap());
+        assert!(!addr.is_secure);
+        assert_eq!(addr.ip().to_string(), "10.1.2.3");
+        assert_eq!(addr.to_string(), "10.1.2.3:8080");
+    }
+}

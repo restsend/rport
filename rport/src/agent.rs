@@ -412,6 +412,10 @@ async fn handle_offer(
                     DataChannelEvent::Message(data) => {
                         let _ = tcp_msg_tx.send(Bytes::from(data));
                     }
+                    DataChannelEvent::BufferedAmountLow(_) => {
+                        // Flow-control hint (W3C bufferedamountlow); nothing to
+                        // do for plain TCP forwarding.
+                    }
                     DataChannelEvent::Close => {
                         info!("Data channel closed for {}:{}", h, port);
                         break;

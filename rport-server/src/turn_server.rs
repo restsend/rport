@@ -142,3 +142,60 @@ impl TurnServer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_urls_with_public_ip() {
+        let ts = TurnServer::new(
+            false,
+            "0.0.0.0:3478".parse().unwrap(),
+            Some("1.2.3.4".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ts.get_turn_url(), "turn:1.2.3.4:3478");
+        assert_eq!(ts.get_stun_url(), "stun:1.2.3.4:3478");
+    }
+
+    #[tokio::test]
+    async fn test_urls_without_public_ip_uses_listen_addr() {
+        let ts = TurnServer::new(false, "127.0.0.1:3478".parse().unwrap(), None)
+            .await
+            .unwrap();
+        assert_eq!(ts.get_turn_url(), "turn:127.0.0.1:3478");
+        assert_eq!(ts.get_stun_url(), "stun:127.0.0.1:3478");
+    }
+
+    #[tokio::test]
+    async fn test_generate_credentials_disabled() {
+        let ts = TurnServer::new(true, "127.0.0.1:3478".parse().unwrap(), None)
+            .await
+            .unwrap();
+        assert!(ts.generate_credentials().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_generate_credentials_enabled() {
+        let ts = TurnServer::new(false, "127.0.0.1:3478".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let cred = ts
+            .generate_credentials()
+            .await
+            .expect("credentials should be generated");
+        assert!(!cred.username.is_empty());
+        assert!(!cred.password.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_start_when_disabled_is_ok() {
+        let ts = TurnServer::new(true, "127.0.0.1:3478".parse().unwrap(), None)
+            .await
+            .unwrap();
+        ts.start().await.expect("disabled TURN should no-op");
+        ts.close().await.expect("close should be idempotent");
+    }
+}
