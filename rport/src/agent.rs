@@ -264,13 +264,7 @@ impl Agent {
                         // Refreshed ICE/TURN credentials from the periodic
                         // GetIceServers task; without this the cached TURN
                         // credential expires and relay allocations fail.
-                        let n = ice_servers.len();
-                        *extra_ice_servers.lock().unwrap() =
-                            ice_servers.into_iter().map(|s| IceServerConfig {
-                                urls: s.urls,
-                                username: s.username,
-                                credential: s.credential,
-                            }).collect();
+                        let n = apply_refreshed_ice_servers(&extra_ice_servers, ice_servers);
                         info!("Refreshed ICE server config ({} servers)", n);
                     }
                     SignalingMessage::Error { reason, .. } => warn!("Server error: {}", reason),
@@ -652,4 +646,75 @@ async fn handle_offer(
     }
 
     Ok(ActiveSession { pc: peer_connection, tasks, reliable })
+}
+
+/// Replace the cached ICE server configuration (including temporary TURN
+/// credentials) with a freshly issued one. Returns the number of servers
+/// stored. Extracted from the message loop so the credential-refresh
+/// behaviour is unit-testable.
+pub(crate) fn apply_refreshed_ice_servers(
+    store: &std::sync::Arc<std::sync::Mutex<Vec<IceServerConfig>>>,
+    ice_servers: Vec<crate::dtls_signaling::IceServerInfo>,
+) -> usize {
+    let refreshed: Vec<IceServerConfig> = ice_servers
+        .into_iter()
+        .map(|s| IceServerConfig {
+            urls: s.urls,
+            username: s.username,
+            credential: s.credential,
+        })
+        .collect();
+    let n = refreshed.len();
+    *store.lock().unwrap() = refreshed;
+    n
+}
+
+#[cfg(test)]
+mod credential_refresh_tests {
+    use super::*;
+    use crate::dtls_signaling::IceServerInfo;
+
+    fn server(urls: &[&str], user: Option<&str>) -> IceServerInfo {
+        IceServerInfo {
+            urls: urls.iter().map(|s| s.to_string()).collect(),
+            username: user.map(|s| s.to_string()),
+            credential: user.map(|s| format!("{}-password", s)),
+        }
+    }
+
+    /// Regression: the agent's signaling connection outlives the temporary
+    /// TURN credentials it caches at connect time. Without the periodic
+    /// GetIceServers refresh, relay allocations fail (TURN 400) exactly when
+    /// the cached credential expires — the "works after restart, dead an
+    /// hour later" outage. The refresh must fully REPLACE the cached config
+    /// (old entries with expired credentials must not linger).
+    #[test]
+    fn refreshed_ice_servers_replace_cached_credentials() {
+        let store = std::sync::Arc::new(std::sync::Mutex::new(vec![IceServerConfig {
+            urls: vec!["stun:expired.example:3478".to_string()],
+            username: Some("expired-username".to_string()),
+            credential: Some("expired-password".to_string()),
+        }]));
+
+        let n = apply_refreshed_ice_servers(
+            &store,
+            vec![
+                server(&["turn:fresh.example:3478?transport=udp"], Some("1730000000")),
+                server(&["stun:fresh.example:3478"], None),
+            ],
+        );
+
+        assert_eq!(n, 2);
+        let stored = store.lock().unwrap().clone();
+        assert_eq!(stored.len(), 2, "stale entries must be replaced, not appended");
+        assert_eq!(
+            stored[0].username.as_deref(),
+            Some("1730000000"),
+            "fresh TURN credentials must be stored"
+        );
+        assert!(
+            !stored.iter().any(|c| c.urls.iter().any(|u| u.contains("expired"))),
+            "expired credentials must not survive a refresh"
+        );
+    }
 }

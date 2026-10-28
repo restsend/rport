@@ -204,3 +204,62 @@ mod tests {
         ts.close().await.expect("close should be idempotent");
     }
 }
+
+#[cfg(test)]
+mod credential_expiry_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use turn::auth::{AuthHandler, LongTermAuthHandler, generate_long_term_credentials};
+
+    /// The exact mechanism of the 2026-10-28 outage: REST-style credentials
+    /// embed their expiry as the username (unix timestamp) and the auth
+    /// handler rejects any credential whose timestamp is in the past —
+    /// regardless of usage. An agent that caches credentials once per
+    /// signaling connection therefore works for `auth_duration` and then has
+    /// every TURN allocation/refresh rejected (observed as TURN 400),
+    /// silently killing the relay path for external clients.
+    #[test]
+    fn turn_credentials_are_time_windowed_and_expire() {
+        let secret = "outage-repro-secret".to_string();
+        let handler = LongTermAuthHandler::new(secret.clone());
+        let realm = "rport.turn";
+        let src: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        // Fresh credential (agent just fetched it at connect): accepted.
+        let (user, _pass) =
+            generate_long_term_credentials(&secret, Duration::from_secs(3600))
+                .expect("generate fresh credential");
+        assert!(
+            handler.auth_handle(&user, realm, src).is_ok(),
+            "fresh credential must authenticate"
+        );
+
+        // The same credential one validity window later: rejected. A
+        // timestamp 1 s in the past is exactly what a cached credential
+        // looks like to the server after `auth_duration` has passed.
+        let expired_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 1;
+        assert!(
+            handler.auth_handle(&expired_ts.to_string(), realm, src).is_err(),
+            "expired time-windowed credential must be rejected — the outage mechanism"
+        );
+    }
+
+    /// The fix: the issued credential lifetime must outlive typical agent
+    /// uptime between signaling reconnects (1 h did not — TURN died exactly
+    /// 60 min after every agent start).
+    #[tokio::test]
+    async fn turn_server_issues_credentials_outliving_agent_uptime() {
+        let srv = TurnServer::new(false, "127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .expect("construct TurnServer");
+        assert_eq!(
+            srv.auth_duration,
+            Duration::from_secs(24 * 3600),
+            "credential lifetime must cover agent uptime between signaling reconnects"
+        );
+    }
+}
