@@ -135,6 +135,13 @@ impl Agent {
         }).await?;
         info!("Registered with server as '{}'", self.id);
 
+        // Shared with the message loop: TURN credentials embedded in the ICE
+        // server config are temporary (REST-style, server-side lifetime) and
+        // MUST be refreshed periodically — the signaling connection outlives
+        // them. A stale credential silently kills the relay path: allocations
+        // start failing (TURN 400) exactly when the cached credential expires.
+        let extra_ice_servers = std::sync::Arc::new(std::sync::Mutex::new(extra_ice_servers));
+
         // Keepalive
         let dtls = client.dtls.clone();
         let keepalive = async move {
@@ -142,6 +149,20 @@ impl Agent {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 if send_message(&dtls, &SignalingMessage::Ping).await.is_err() {
                     warn!("DTLS keepalive send failed");
+                    break;
+                }
+            }
+        };
+
+        // Periodically re-request the ICE server config so TURN credentials
+        // never outlive their validity. The response is handled by the message
+        // loop below (IceServers arm) and updates the shared store.
+        let refresh_dtls = client.dtls.clone();
+        let ice_refresh = async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+                if send_message(&refresh_dtls, &SignalingMessage::GetIceServers).await.is_err() {
+                    warn!("ICE config refresh send failed");
                     break;
                 }
             }
@@ -239,6 +260,19 @@ impl Agent {
                         send_message(&client.dtls, &SignalingMessage::Pong).await.ok();
                     }
                     SignalingMessage::Pong => {}
+                    SignalingMessage::IceServers { ice_servers } => {
+                        // Refreshed ICE/TURN credentials from the periodic
+                        // GetIceServers task; without this the cached TURN
+                        // credential expires and relay allocations fail.
+                        let n = ice_servers.len();
+                        *extra_ice_servers.lock().unwrap() =
+                            ice_servers.into_iter().map(|s| IceServerConfig {
+                                urls: s.urls,
+                                username: s.username,
+                                credential: s.credential,
+                            }).collect();
+                        info!("Refreshed ICE server config ({} servers)", n);
+                    }
                     SignalingMessage::Error { reason, .. } => warn!("Server error: {}", reason),
                     other => warn!("Unexpected message from server: {:?}", other),
                 }
@@ -252,6 +286,7 @@ impl Agent {
 
         tokio::select! {
             _ = keepalive => {}
+            _ = ice_refresh => {}
             _ = message_loop => {}
         }
 
@@ -267,7 +302,7 @@ async fn handle_offer(
     targets: Option<Vec<Target>>,
     acl: Option<Acl>,
     webrtc_config: WebRTCConfig,
-    extra_ice_servers: &[IceServerConfig],
+    extra_ice_servers: &std::sync::Arc<std::sync::Mutex<Vec<IceServerConfig>>>,
     done_tx: mpsc::UnboundedSender<String>,
 ) -> Result<ActiveSession> {
     // Resolve targets
@@ -307,7 +342,8 @@ async fn handle_offer(
     }
 
     // Create WebRTC peer connection
-    let peer_connection = webrtc_config.create_peer_connection_with(extra_ice_servers).await?;
+    let extra_ice_servers = extra_ice_servers.lock().unwrap().clone();
+    let peer_connection = webrtc_config.create_peer_connection_with(&extra_ice_servers).await?;
 
     // Tasks spawned for this session — tracked for cleanup
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();

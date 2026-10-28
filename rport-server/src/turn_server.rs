@@ -36,7 +36,12 @@ impl TurnServer {
     ) -> Result<Self> {
         let secret = format!("{}", rand::random::<u64>());
         Ok(Self {
-            auth_duration: Duration::from_secs(3600),
+            // REST-style credentials are issued once per signaling connection
+            // and cached by peers; they must outlive a typical agent uptime
+            // between signaling reconnects. 1 h proved too short: TURN
+            // allocations started failing exactly 60 min after each agent
+            // start, silently killing the relay path for external clients.
+            auth_duration: Duration::from_secs(24 * 3600),
             disabled,
             listen_addr,
             public_ip,
@@ -96,7 +101,7 @@ impl TurnServer {
         Ok(())
     }
 
-    /// Generate temporary credentials valid for 1 minute
+    /// Generate temporary credentials valid for `auth_duration`
     pub async fn generate_credentials(&self) -> Option<TurnCredentials> {
         if self.disabled {
             return None;
