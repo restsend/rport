@@ -192,14 +192,29 @@ pub fn load_certificate(cert_path: &Path, key_path: &Path) -> Result<Certificate
     let key_pem = std::fs::read_to_string(key_path)
         .with_context(|| format!("Failed to read DTLS key from {}", key_path.display()))?;
 
-    let pem_data = pem::parse(&cert_pem)
-        .with_context(|| format!("Failed to parse DTLS cert PEM from {}", cert_path.display()))?;
-    let der_bytes = pem_data.contents().to_vec();
+    let cert_der = pem::parse(&cert_pem)
+        .with_context(|| format!("Failed to parse DTLS cert PEM from {}", cert_path.display()))?
+        .contents()
+        .to_vec();
 
-    let mut cert = Certificate::default();
-    cert.certificate = vec![der_bytes];
-    cert.private_key = key_pem;
-    Ok(cert)
+    // rustrtc 0.4 carries the private key as PKCS#8 DER. Accept a PKCS#8 PEM
+    // section ("PRIVATE KEY"); traditional PKCS#1 ("RSA PRIVATE KEY") or
+    // SEC1 ("EC PRIVATE KEY") encodings must be converted first.
+    let key_section = pem::parse(&key_pem)
+        .with_context(|| format!("Failed to parse DTLS key PEM from {}", key_path.display()))?;
+    if key_section.tag() != "PRIVATE KEY" {
+        anyhow::bail!(
+            "DTLS key {} uses '{}' PEM; PKCS#8 ('PRIVATE KEY') is required. \
+             Convert with: openssl pkcs8 -topk8 -nocrypt -in {} -out {}.p8",
+            key_path.display(),
+            key_section.tag(),
+            key_path.display(),
+            key_path.display()
+        );
+    }
+
+    Certificate::from_pkcs8_der(cert_der, key_section.contents().to_vec())
+        .with_context(|| format!("Invalid DTLS key material in {}", key_path.display()))
 }
 
 impl DtlsHandler {
