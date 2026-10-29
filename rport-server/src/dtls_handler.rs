@@ -338,20 +338,7 @@ impl DtlsHandler {
                             };
                             match msg {
                                 SignalingMessage::GetIceServers => {
-                                    let mut ice_servers = vec![IceServerInfo {
-                                        urls: vec![state_c.turn_server.get_stun_url()],
-                                        username: None,
-                                        credential: None,
-                                    }];
-                                    if let Some(creds) = state_c.turn_server.generate_credentials().await {
-                                        ice_servers.push(IceServerInfo {
-                                            urls: vec![state_c.turn_server.get_turn_url()],
-                                            username: Some(creds.username),
-                                            credential: Some(creds.password),
-                                        });
-                                    }
-                                    info!("Sending ICE server config ({} servers) to {} in response to GetIceServers", ice_servers.len(), addr);
-                                    let _ = send_msg(&dtls_c, &SignalingMessage::IceServers { ice_servers }).await;
+                                    Self::send_ice_server_config(&dtls_c, &state_c, &addr.to_string()).await;
                                     continue;
                                 }
                                 other => break other,
@@ -371,7 +358,7 @@ impl DtlsHandler {
                                 let agents_for_loop = agents_c.clone();
                                 let dtls_for_cleanup = dtls_c.clone();
                                 agents_c.write().await.insert(id.clone(), dtls_c.clone());
-                                Self::agent_loop(dtls_c, &mut data_rx, agents_for_loop, sessions_c, id.clone()).await;
+                                Self::agent_loop(dtls_c, &mut data_rx, agents_for_loop, sessions_c, state_c.clone(), id.clone()).await;
                                 let superseded = {
                                     let mut agents_w = agents_c.write().await;
                                     let is_current = agents_w.get(&id)
@@ -416,7 +403,7 @@ impl DtlsHandler {
                                         sessions_c.write().await.remove(&sid);
                                         return;
                                     }
-                                    Self::client_loop(dtls_c, &mut data_rx, sessions_c, agents_c, sid, aid).await;
+                                    Self::client_loop(dtls_c, &mut data_rx, sessions_c, agents_c, state_c.clone(), sid, aid).await;
                                 } else if let Some(http_agent) = Self::find_http_agent(&state_c, &agent_id).await {
                                     info!("Agent '{}' found in HTTP/SSE registry (sid={}), bridging signaling", agent_id, session_id);
                                     let uuid = Uuid::new_v4();
@@ -490,11 +477,36 @@ impl DtlsHandler {
         }
     }
 
+    /// Build and send a fresh ICE server config over the given DTLS transport.
+    ///
+    /// TURN credentials are temporary (REST-style, server-side lifetime) and
+    /// are re-issued on every GetIceServers. This must also be answered on the
+    /// registered connection (agent_loop / client_loop), not only pre-Register:
+    /// the agent re-requests the config every 30 min, and a dropped request
+    /// means expired credentials and TURN 400 on long-lived connections.
+    async fn send_ice_server_config(dtls: &Arc<DtlsTransport>, state: &AppState, peer: &str) {
+        let mut ice_servers = vec![IceServerInfo {
+            urls: vec![state.turn_server.get_stun_url()],
+            username: None,
+            credential: None,
+        }];
+        if let Some(creds) = state.turn_server.generate_credentials().await {
+            ice_servers.push(IceServerInfo {
+                urls: vec![state.turn_server.get_turn_url()],
+                username: Some(creds.username),
+                credential: Some(creds.password),
+            });
+        }
+        info!("Sending ICE server config ({} servers) to {} in response to GetIceServers", ice_servers.len(), peer);
+        let _ = send_msg(dtls, &SignalingMessage::IceServers { ice_servers }).await;
+    }
+
     async fn agent_loop(
         dtls: Arc<DtlsTransport>,
         data_rx: &mut mpsc::UnboundedReceiver<Bytes>,
         _agents: Arc<RwLock<HashMap<String, Arc<DtlsTransport>>>>,
         sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
+        state: AppState,
         agent_id: String,
     ) {
         // Keepalive: server pings agent every 15s; idle timeout = 3 × interval
@@ -566,6 +578,12 @@ impl DtlsHandler {
                     let _ = send_msg(&dtls, &SignalingMessage::Pong).await;
                 }
                 SignalingMessage::Pong => {}
+                SignalingMessage::GetIceServers => {
+                    // Periodic TURN-credential refresh from the agent: answer
+                    // with freshly issued credentials so the agent's cached
+                    // config never expires mid-connection.
+                    Self::send_ice_server_config(&dtls, &state, &agent_id).await;
+                }
                 SignalingMessage::Error { reason, .. } => {
                     warn!("Agent '{}' error: {}", agent_id, reason);
                 }
@@ -598,6 +616,7 @@ impl DtlsHandler {
         data_rx: &mut mpsc::UnboundedReceiver<Bytes>,
         sessions: Arc<RwLock<HashMap<String, ClientSession>>>,
         agents: Arc<RwLock<HashMap<String, Arc<DtlsTransport>>>>,
+        state: AppState,
         session_id: String,
         agent_id: String,
     ) {
@@ -663,6 +682,11 @@ impl DtlsHandler {
                     let _ = send_msg(&dtls, &SignalingMessage::Pong).await;
                 }
                 SignalingMessage::Pong => {}
+                SignalingMessage::GetIceServers => {
+                    // Keep the protocol uniform: any registered peer may ask
+                    // for fresh ICE servers (see send_ice_server_config).
+                    Self::send_ice_server_config(&dtls, &state, &session_id).await;
+                }
                 SignalingMessage::Error { reason, .. } => {
                     warn!("Client session {} error: {}", session_id, reason);
                     break;
@@ -928,5 +952,48 @@ mod tests {
             }
             other => panic!("expected Ack, got {:?}", other),
         }
+    }
+
+    /// End-to-end regression: GetIceServers must be answered BOTH pre-Register
+    /// and on the registered connection. The agent re-requests its ICE config
+    /// every 30 min to refresh temporary TURN credentials; when the server
+    /// dropped the post-Register request, long-lived agent connections ended
+    /// up with expired credentials and failing TURN allocations (v0.1.30 fix).
+    #[tokio::test]
+    async fn test_get_ice_servers_answered_after_register() {
+        use rport::{DtlsClient, SignalingMessage as ClientSignalingMessage};
+
+        let turn = rport_server::turn_server::TurnServer::new(
+            false,
+            "127.0.0.1:3479".parse().unwrap(),
+            None,
+        ).await.unwrap();
+        let state = rport_server::AppState::new_with_turn(std::sync::Arc::new(turn));
+
+        let addr = "127.0.0.1:39443";
+        let handle = DtlsHandler::listen(addr.to_string(), None, state).await.unwrap();
+
+        let mut client = DtlsClient::connect(addr, None).await.unwrap();
+
+        // Pre-Register: initial config fetch (backward-compatible path).
+        client.send(&ClientSignalingMessage::GetIceServers).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), client.recv()).await
+            .expect("timed out waiting for IceServers pre-Register").unwrap();
+        assert!(matches!(reply, ClientSignalingMessage::IceServers { .. }),
+                "expected IceServers pre-Register, got {:?}", reply);
+
+        // Register, then the periodic refresh: must still be answered.
+        client.send(&ClientSignalingMessage::Register {
+            token: "test-token".into(),
+            id: "ice-refresh-test".into(),
+        }).await.unwrap();
+        client.send(&ClientSignalingMessage::GetIceServers).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), client.recv()).await
+            .expect("timed out waiting for IceServers AFTER Register — GetIceServers refresh was dropped").unwrap();
+        assert!(matches!(reply, ClientSignalingMessage::IceServers { .. }),
+                "expected IceServers after Register, got {:?}", reply);
+
+        client.close();
+        handle.abort();
     }
 }
