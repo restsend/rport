@@ -257,6 +257,10 @@ where
     // Session is over — stop answering signaling keepalives so the server
     // reclaims the DTLS session instead of keeping it alive forever.
     signaling_done.cancel();
+    // The event-drain and state-monitor tasks hold Arc clones of the peer
+    // connection; without an explicit close they would keep its ICE sockets
+    // (and their file descriptors) alive forever in a long-running client.
+    peer_connection.close();
     Ok(())
 }
 

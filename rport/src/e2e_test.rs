@@ -21,7 +21,7 @@ fn test_rtc_config() -> RtcConfiguration {
         ice_disconnect_threshold: Duration::from_secs(10),
         enable_upnp: false,
         prefer_srflx_over_natted_host: false,
-        ..Default::default()
+        ..RtcConfiguration::webrtc()
     }
 }
 

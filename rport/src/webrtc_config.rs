@@ -57,7 +57,7 @@ impl WebRTCConfig {
             ice_disconnect_grace: self.ice_disconnect_grace.unwrap_or_else(|| Duration::from_secs(15)),
             enable_upnp: self.enable_upnp,
             prefer_srflx_over_natted_host: true,
-            ..Default::default()
+            ..RtcConfiguration::webrtc()
         }
     }
 

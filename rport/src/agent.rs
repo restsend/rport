@@ -16,6 +16,7 @@ use rustrtc::{
     SessionDescription,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -46,6 +47,18 @@ impl ActiveSession {
 impl Drop for ActiveSession {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+/// Signals the owning data-channel task when a forwarding task ends. A drop
+/// guard is used so every exit path (TCP EOF, connect error, panic) wakes the
+/// channel task and lets the session be reaped immediately instead of waiting
+/// for the SCTP heartbeat timeout.
+struct ForwardDone(tokio::sync::mpsc::UnboundedSender<()>);
+
+impl Drop for ForwardDone {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
     }
 }
 
@@ -369,75 +382,125 @@ async fn handle_offer(
     let offer = SessionDescription::parse(SdpType::Offer, &offer_sdp)?;
     peer_connection.set_remote_description(offer).await?;
 
-    // Spawn forwarding handlers per data channel
+    // Spawn forwarding handlers per data channel. When every channel of the
+    // session has closed, report the session on `done_tx` so its peer
+    // connection (and its ICE UDP sockets) is torn down. Without this, a
+    // client that merely closes the data channel leaves an "active" session
+    // behind forever and the agent eventually exhausts its file descriptors
+    // (`Too many open files`).
+    let remaining_channels = Arc::new(AtomicUsize::new(data_channels.len()));
     for (dc, host, port) in data_channels {
         let pc = peer_connection.clone();
         let h = host.clone();
+        let sid = session_id.to_string();
+        let done = done_tx.clone();
+        let remaining = remaining_channels.clone();
 
         tasks.push(tokio::spawn(async move {
             let dc_id = dc.id;
             let (tcp_msg_tx, tcp_msg_rx) = mpsc::unbounded_channel::<Bytes>();
-            let tcp_msg_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(tcp_msg_rx)));
+            let (forward_done_tx, mut forward_done_rx) = mpsc::unbounded_channel::<()>();
+            let mut tcp_msg_rx = Some(tcp_msg_rx);
+            let mut forward_task: Option<tokio::task::JoinHandle<()>> = None;
 
             loop {
-                let event = match dc.recv().await {
-                    Some(e) => e,
-                    None => break,
+                // Once forwarding has started, also watch the forwarding task:
+                // when the target TCP connection ends (the normal end of an
+                // SSH/VNC session), the session must be reaped right away.
+                let event = match forward_task.as_mut() {
+                    Some(_) => tokio::select! {
+                        event = dc.recv() => match event {
+                            Some(e) => e,
+                            None => break,
+                        },
+                        _ = forward_done_rx.recv() => {
+                            debug!("Forwarding task ended for {}:{}, closing session", h, port);
+                            break;
+                        }
+                    },
+                    None => match dc.recv().await {
+                        Some(e) => e,
+                        None => break,
+                    },
                 };
 
                 match event {
                     DataChannelEvent::Open => {
                         info!("Data channel opened, forwarding to {}:{}", h, port);
+                        // The forwarding task is aborted when the data channel
+                        // closes, which closes the target TCP socket too.
+                        if forward_task.is_some() {
+                            continue;
+                        }
+                        let Some(mut rx) = tcp_msg_rx.take() else {
+                            continue;
+                        };
                         let pc2 = pc.clone();
                         let h2 = h.clone();
-                        let rx_arc = tcp_msg_rx.clone();
 
-                        tokio::spawn(async move {
-                            let rx_opt = rx_arc.lock().unwrap().take();
-                            let mut rx = match rx_opt {
-                                Some(r) => r,
-                                None => return,
+                        let channel_done = forward_done_tx.clone();
+                        forward_task = Some(tokio::spawn(async move {
+                            let _forward_done = ForwardDone(channel_done);
+                            let tcp = match TcpStream::connect(format!("{}:{}", h2, port)).await {
+                                Ok(tcp) => tcp,
+                                Err(e) => {
+                                    error!("Failed to connect to {}:{}: {}", h2, port, e);
+                                    // Tell the client this attempt failed, so it
+                                    // does not wait on a channel that will never
+                                    // carry data.
+                                    let _ = pc2.send_data(dc_id, &[]).await;
+                                    return;
+                                }
                             };
 
-                            match TcpStream::connect(format!("{}:{}", h2, port)).await {
-                                Ok(tcp) => {
-                                    info!("TCP connected to {}:{}, forwarding...", h2, port);
-                                    // Disable Nagle for interactive protocols (SSH).
-                                    let _ = tcp.set_nodelay(true);
-                                    let (mut tcp_read, mut tcp_write) = tcp.into_split();
-                                    let pc3 = pc2.clone();
-                                    let pc_write = pc2.clone();
-                                    tokio::spawn(async move {
-                                        let mut buf = [0u8; 1024];
-                                        let mut total: u64 = 0;
-                                        loop {
-                                            match tcp_read.read(&mut buf).await {
-                                                Ok(0) | Err(_) => {
-                                                    debug!("agent tcp_read EOF (sent {} bytes total), signaling client", total);
-                                                    // Send zero-length message as EOF marker so
-                                                    // the client knows the remote TCP closed.
-                                                    let _ = pc3.send_data(dc_id, &[]).await;
+                            info!("TCP connected to {}:{}, forwarding...", h2, port);
+                            // Disable Nagle for interactive protocols (SSH).
+                            let _ = tcp.set_nodelay(true);
+                            let (mut tcp_read, mut tcp_write) = tcp.into_split();
+                            let mut buf = [0u8; 1024];
+                            let mut total: u64 = 0;
+
+                            // Drive both directions in this one task: dropping
+                            // it (on data-channel close) closes both halves of
+                            // the TCP socket instead of leaking the read half.
+                            loop {
+                                tokio::select! {
+                                    read = tcp_read.read(&mut buf) => {
+                                        match read {
+                                            Ok(0) | Err(_) => {
+                                                debug!("agent tcp_read EOF (sent {} bytes total), signaling client", total);
+                                                // Zero-length message = EOF marker.
+                                                let _ = pc2.send_data(dc_id, &[]).await;
+                                                break;
+                                            }
+                                            Ok(n) => {
+                                                total += n as u64;
+                                                if pc2.send_data(dc_id, &buf[..n]).await.is_err() {
                                                     break;
-                                                }
-                                                Ok(n) => {
-                                                    total += n as u64;
-                                                    if pc3.send_data(dc_id, &buf[..n]).await.is_err() { break; }
                                                 }
                                             }
                                         }
-                                    });
-                                    while let Some(data) = rx.recv().await {
-                                        if tcp_write.write_all(&data).await.is_err() {
-                                            debug!("agent tcp_write failed, signaling client");
-                                            let _ = pc_write.send_data(dc_id, &[]).await;
-                                            break;
+                                    }
+                                    data = rx.recv() => {
+                                        match data {
+                                            Some(data) => {
+                                                if tcp_write.write_all(&data).await.is_err() {
+                                                    debug!("agent tcp_write failed, signaling client");
+                                                    let _ = pc2.send_data(dc_id, &[]).await;
+                                                    break;
+                                                }
+                                                if tcp_write.flush().await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            // Data channel gone: close the target TCP
+                                            // connection rather than holding it open.
+                                            None => break,
                                         }
-                                        let _ = tcp_write.flush().await;
                                     }
                                 }
-                                Err(e) => error!("Failed to connect to {}:{}: {}", h2, port, e),
                             }
-                        });
+                        }));
                     }
                     DataChannelEvent::Message(data) => {
                         let _ = tcp_msg_tx.send(Bytes::from(data));
@@ -451,6 +514,14 @@ async fn handle_offer(
                         break;
                     }
                 }
+            }
+
+            if let Some(task) = forward_task.take() {
+                task.abort();
+            }
+            // Last channel to end owns the session teardown.
+            if remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
+                let _ = done.send(sid);
             }
         }));
     }
