@@ -50,7 +50,13 @@ impl WebRTCConfig {
             sctp_rto_initial: self.sctp_rto_initial.unwrap_or_else(|| Duration::from_millis(400)),
             sctp_rto_min: self.sctp_rto_min.unwrap_or_else(|| Duration::from_millis(200)),
             sctp_rto_max: self.sctp_rto_max.unwrap_or_else(|| Duration::from_secs(30)),
-            sctp_max_association_retransmits: self.sctp_max_association_retransmits.unwrap_or(20),
+            // 20 missed heartbeats (5 minutes by default) lets dead sessions
+            // linger long enough to exhaust a 1024-FD systemd service when
+            // clients connect/disconnect frequently. Four misses (~60s at
+            // the 15s heartbeat interval) bound stale sessions while still
+            // tolerating transient packet loss; deployments on lossy links
+            // can raise `sctp_max_association_retransmits` in config.
+            sctp_max_association_retransmits: self.sctp_max_association_retransmits.unwrap_or(4),
             sctp_receive_window: self.sctp_receive_window.unwrap_or(2 * 1024 * 1024),
             ice_connection_timeout: self.ice_connection_timeout.unwrap_or_else(|| Duration::from_secs(300)),
             ice_disconnect_threshold: self.ice_disconnect_threshold.unwrap_or_else(|| Duration::from_secs(30)),
