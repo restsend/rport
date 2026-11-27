@@ -55,15 +55,22 @@ jobs:
             # /x-tools/<triple>/bin (NOT /usr/local) and names binaries with
             # the full triple (aarch64-unknown-linux-musl-gcc). The image
             # makes them visible via ENV PATH, which `docker create`+`cp`
-            # does not inherit — so copy the toolchain tree out and put its
-            # bin on PATH for the following steps.
+            # does not inherit — so stream the toolchain tree out (the tar
+            # stream keeps root ownership, so `sudo` must untar it) and put
+            # its bin on PATH for the following steps.
             docker pull "${{ matrix.cross_image }}"
             cid=$(docker create "${{ matrix.cross_image }}")
-            docker cp "$cid:/x-tools" /tmp/xtools
+            sudo mkdir -p /opt/xtools-extract
+            docker cp "$cid:/x-tools" - | sudo tar -C /opt/xtools-extract -xf -
             docker rm "$cid"
             sudo mkdir -p /x-tools
-            sudo tar -C /tmp/xtools -cf - . | sudo tar -C /x-tools -xf -
-            sudo rm -rf /tmp/xtools
+            # docker cp tar streams may nest the path basename; handle both.
+            if [ -d /opt/xtools-extract/x-tools ]; then
+              sudo cp -a /opt/xtools-extract/x-tools/. /x-tools/
+            else
+              sudo cp -a /opt/xtools-extract/. /x-tools/
+            fi
+            sudo rm -rf /opt/xtools-extract
             sudo chmod -R a+rX /x-tools
             echo "/x-tools/aarch64-unknown-linux-musl/bin" >> "$GITHUB_PATH"
             aarch64-unknown-linux-musl-gcc --version
