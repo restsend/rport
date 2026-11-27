@@ -55,14 +55,17 @@ jobs:
             # CDN — fast on runners, unlike musl.cc which throttles) and overlay
             # its /usr/local onto the runner. Extracting to the same absolute
             # path keeps the gcc driver's internal libexec/sysroot paths valid.
-            # --remove-destination: the image's /usr/local/man (directory)
-            # collides with the runner's non-directory /usr/local/man — plain
-            # `cp -a` errors out on that mismatch.
+            # Extracted via tar: the image's /usr/local/man (directory) clashes
+            # with the runner's non-directory /usr/local/man — `cp -a` (even
+            # with --remove-destination) errors on that mismatch, and man
+            # pages are useless in CI anyway.
             docker pull "${{ matrix.cross_image }}"
             cid=$(docker create "${{ matrix.cross_image }}")
             docker cp "$cid:/usr/local" /tmp/xlocal
             docker rm "$cid"
-            sudo cp -a --remove-destination /tmp/xlocal/. /usr/local/
+            sudo tar -C /tmp/xlocal --exclude='./man' --exclude='./share/man' -cf - . \
+              | sudo tar -C /usr/local --overwrite -xf -
+            sudo rm -rf /tmp/xlocal
             ${{ matrix.cc }} --version
           fi
 
