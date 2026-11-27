@@ -1,6 +1,6 @@
 use crate::{
     acl::Acl,
-    config::{IceServerConfig, RportConfig},
+    config::{IceServerConfig, Protocol, RportConfig},
     dtls_signaling::{DtlsClient, SignalingMessage, Target, send_message},
     reliable::ReliableSession,
     webrtc_config::WebRTCConfig,
@@ -10,7 +10,7 @@ use bytes::Bytes;
 use rustrtc::{
     transports::{
         dtls::DtlsTransport,
-        sctp::{DataChannelConfig, DataChannelEvent},
+        sctp::DataChannelEvent,
     },
     IceCandidate, IceGatheringState, PeerConnection, PeerConnectionState, SdpType,
     SessionDescription,
@@ -20,9 +20,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+use crate::client::{data_channel_config_for, dc_label_for};
 
 pub const RECONNECT_INTERVAL: u64 = 5;
 
@@ -313,18 +315,22 @@ async fn handle_offer(
     done_tx: mpsc::UnboundedSender<String>,
 ) -> Result<ActiveSession> {
     // Resolve targets
-    let targets: Vec<(String, u16)> = if let Some(tgts) = targets {
+    let targets: Vec<(String, u16, Protocol)> = if let Some(tgts) = targets {
         tgts.iter().map(|t| {
             let host = t.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
-            (host, t.port)
+            let proto = match t.proto.as_deref() {
+                Some("udp") | Some("UDP") => Protocol::Udp,
+                _ => Protocol::Tcp,
+            };
+            (host, t.port, proto)
         }).collect()
     } else {
-        vec![("127.0.0.1".to_string(), 22)]
+        vec![("127.0.0.1".to_string(), 22, Protocol::Tcp)]
     };
 
     // ACL check
     if let Some(ref acl) = acl {
-        for (host, port) in &targets {
+        for (host, port, _) in &targets {
             let ip = match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
                 Ok(mut addrs) => addrs.next().map(|a| a.ip()).unwrap_or_else(|| {
                     use std::net::IpAddr;
@@ -360,22 +366,19 @@ async fn handle_offer(
         dc_label: String,
         host: String,
         port: u16,
+        proto: Protocol,
     }
 
-    let fwd_targets: Vec<FwdTarget> = targets.into_iter().map(|(host, port)| {
-        let label = format!("fwd:{}:{}", host, port);
-        FwdTarget { dc_label: label, host, port }
+    let fwd_targets: Vec<FwdTarget> = targets.into_iter().map(|(host, port, proto)| {
+        let label = dc_label_for(&host, port, proto);
+        FwdTarget { dc_label: label, host, port, proto }
     }).collect();
 
     let mut data_channels = Vec::new();
     for ft in &fwd_targets {
-        let dc_config = DataChannelConfig {
-            ordered: true,
-            label: ft.dc_label.clone(),
-            ..Default::default()
-        };
+        let dc_config = data_channel_config_for(&ft.dc_label, ft.proto);
         let dc = peer_connection.create_data_channel(&ft.dc_label, Some(dc_config))?;
-        data_channels.push((dc, ft.host.clone(), ft.port));
+        data_channels.push((dc, ft.host.clone(), ft.port, ft.proto));
     }
 
     // Set remote description
@@ -389,7 +392,7 @@ async fn handle_offer(
     // behind forever and the agent eventually exhausts its file descriptors
     // (`Too many open files`).
     let remaining_channels = Arc::new(AtomicUsize::new(data_channels.len()));
-    for (dc, host, port) in data_channels {
+    for (dc, host, port, proto) in data_channels {
         let pc = peer_connection.clone();
         let h = host.clone();
         let sid = session_id.to_string();
@@ -398,15 +401,16 @@ async fn handle_offer(
 
         tasks.push(tokio::spawn(async move {
             let dc_id = dc.id;
-            let (tcp_msg_tx, tcp_msg_rx) = mpsc::unbounded_channel::<Bytes>();
+            let (dc_msg_tx, dc_msg_rx) = mpsc::unbounded_channel::<Bytes>();
             let (forward_done_tx, mut forward_done_rx) = mpsc::unbounded_channel::<()>();
-            let mut tcp_msg_rx = Some(tcp_msg_rx);
+            let mut dc_msg_rx = Some(dc_msg_rx);
             let mut forward_task: Option<tokio::task::JoinHandle<()>> = None;
 
             loop {
                 // Once forwarding has started, also watch the forwarding task:
-                // when the target TCP connection ends (the normal end of an
-                // SSH/VNC session), the session must be reaped right away.
+                // when the target connection ends (the normal end of an
+                // SSH/VNC session, or an idle UDP session), the session must
+                // be reaped right away.
                 let event = match forward_task.as_mut() {
                     Some(_) => tokio::select! {
                         event = dc.recv() => match event {
@@ -426,13 +430,13 @@ async fn handle_offer(
 
                 match event {
                     DataChannelEvent::Open => {
-                        info!("Data channel opened, forwarding to {}:{}", h, port);
+                        info!("Data channel opened, forwarding {} to {}:{}", proto.as_str(), h, port);
                         // The forwarding task is aborted when the data channel
-                        // closes, which closes the target TCP socket too.
+                        // closes, which closes the target socket too.
                         if forward_task.is_some() {
                             continue;
                         }
-                        let Some(mut rx) = tcp_msg_rx.take() else {
+                        let Some(rx) = dc_msg_rx.take() else {
                             continue;
                         };
                         let pc2 = pc.clone();
@@ -441,69 +445,18 @@ async fn handle_offer(
                         let channel_done = forward_done_tx.clone();
                         forward_task = Some(tokio::spawn(async move {
                             let _forward_done = ForwardDone(channel_done);
-                            let tcp = match TcpStream::connect(format!("{}:{}", h2, port)).await {
-                                Ok(tcp) => tcp,
-                                Err(e) => {
-                                    error!("Failed to connect to {}:{}: {}", h2, port, e);
-                                    // Tell the client this attempt failed, so it
-                                    // does not wait on a channel that will never
-                                    // carry data.
-                                    let _ = pc2.send_data(dc_id, &[]).await;
-                                    return;
+                            match proto {
+                                Protocol::Tcp => {
+                                    run_tcp_forward(pc2, dc_id, h2, port, rx).await;
                                 }
-                            };
-
-                            info!("TCP connected to {}:{}, forwarding...", h2, port);
-                            // Disable Nagle for interactive protocols (SSH).
-                            let _ = tcp.set_nodelay(true);
-                            let (mut tcp_read, mut tcp_write) = tcp.into_split();
-                            let mut buf = [0u8; 1024];
-                            let mut total: u64 = 0;
-
-                            // Drive both directions in this one task: dropping
-                            // it (on data-channel close) closes both halves of
-                            // the TCP socket instead of leaking the read half.
-                            loop {
-                                tokio::select! {
-                                    read = tcp_read.read(&mut buf) => {
-                                        match read {
-                                            Ok(0) | Err(_) => {
-                                                debug!("agent tcp_read EOF (sent {} bytes total), signaling client", total);
-                                                // Zero-length message = EOF marker.
-                                                let _ = pc2.send_data(dc_id, &[]).await;
-                                                break;
-                                            }
-                                            Ok(n) => {
-                                                total += n as u64;
-                                                if pc2.send_data(dc_id, &buf[..n]).await.is_err() {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    data = rx.recv() => {
-                                        match data {
-                                            Some(data) => {
-                                                if tcp_write.write_all(&data).await.is_err() {
-                                                    debug!("agent tcp_write failed, signaling client");
-                                                    let _ = pc2.send_data(dc_id, &[]).await;
-                                                    break;
-                                                }
-                                                if tcp_write.flush().await.is_err() {
-                                                    break;
-                                                }
-                                            }
-                                            // Data channel gone: close the target TCP
-                                            // connection rather than holding it open.
-                                            None => break,
-                                        }
-                                    }
+                                Protocol::Udp => {
+                                    run_udp_forward(pc2, dc_id, h2, port, rx).await;
                                 }
                             }
                         }));
                     }
                     DataChannelEvent::Message(data) => {
-                        let _ = tcp_msg_tx.send(Bytes::from(data));
+                        let _ = dc_msg_tx.send(Bytes::from(data));
                     }
                     DataChannelEvent::BufferedAmountLow(_) => {
                         // Flow-control hint (W3C bufferedamountlow); nothing to
@@ -658,65 +611,233 @@ async fn handle_offer(
 
     // Trickle ICE: forward gathered candidates as they arrive
     {
+        let pc_candidates = peer_connection.clone();
         tasks.push(tokio::spawn(async move {
-            if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());
-                {
-                    let mut r = rel.lock().unwrap();
-                    r.prepare_send(&mut msg, true);
-                }
-                let _ = send_message(&dtls_c, &msg).await;
-                return;
-            }
-            loop {
+            // Candidates already delivered live (keyed by SDP line) so the
+            // Complete-time snapshot flush does not duplicate them.
+            let mut sent: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // Never short-circuit on an already-Complete flag: when gathering
+            // finishes with a SINGLE candidate (relay-only ICE policy, where
+            // the TURN allocation completes a moment after the answer went
+            // out), Complete is observable before any candidate is drained
+            // and dropping straight to end-of-candidates silently discards
+            // that candidate — ICE then has nothing to check and the session
+            // stalls until timeout. On Complete, flush the authoritative
+            // `local_candidates()` snapshot first, then end-of-candidates.
+            let mut gathering_done = *gathering_state_rx.borrow() == IceGatheringState::Complete;
+            while !gathering_done {
                 tokio::select! {
                     result = candidate_rx.recv() => {
                         match result {
                             Ok(candidate) => {
-                                info!(
-                                    "Local ICE candidate: {} {} {} {:?}",
-                                    candidate.address, candidate.transport, candidate.priority, candidate.typ,
-                                );
-                                let mut msg = SignalingMessage::new_candidate(
-                                    sid.clone(),
-                                    candidate.to_sdp(),
-                                );
-                                {
-                                    let mut r = rel.lock().unwrap();
-                                    r.prepare_send(&mut msg, false);
-                                }
-                                let _ = send_message(&dtls_c, &msg).await;
-                                if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                                    let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());
+                                let sdp = candidate.to_sdp();
+                                if sent.insert(sdp.clone()) {
+                                    info!(
+                                        "Local ICE candidate: {} {} {} {:?}",
+                                        candidate.address, candidate.transport, candidate.priority, candidate.typ,
+                                    );
+                                    let mut msg = SignalingMessage::new_candidate(
+                                        sid.clone(),
+                                        sdp,
+                                    );
                                     {
                                         let mut r = rel.lock().unwrap();
-                                        r.prepare_send(&mut msg, true);
+                                        r.prepare_send(&mut msg, false);
                                     }
                                     let _ = send_message(&dtls_c, &msg).await;
-                                    break;
                                 }
+                                gathering_done = *gathering_state_rx.borrow() == IceGatheringState::Complete;
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                         }
                     }
                     _ = gathering_state_rx.changed() => {
-                        if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                            let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());
-                            {
-                                let mut r = rel.lock().unwrap();
-                                r.prepare_send(&mut msg, true);
-                            }
-                            let _ = send_message(&dtls_c, &msg).await;
+                        gathering_done = *gathering_state_rx.borrow() == IceGatheringState::Complete;
+                    }
+                }
+            }
+            for candidate in pc_candidates.ice_transport().local_candidates() {
+                let sdp = candidate.to_sdp();
+                if sent.insert(sdp.clone()) {
+                    info!(
+                        "Local ICE candidate (flush): {} {} {} {:?}",
+                        candidate.address, candidate.transport, candidate.priority, candidate.typ,
+                    );
+                    let mut msg = SignalingMessage::new_candidate(
+                        sid.clone(),
+                        sdp,
+                    );
+                    {
+                        let mut r = rel.lock().unwrap();
+                        r.prepare_send(&mut msg, false);
+                    }
+                    let _ = send_message(&dtls_c, &msg).await;
+                }
+            }
+            let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());
+            {
+                let mut r = rel.lock().unwrap();
+                r.prepare_send(&mut msg, true);
+            }
+            let _ = send_message(&dtls_c, &msg).await;
+        }));
+    }
+
+    Ok(ActiveSession { pc: peer_connection, tasks, reliable })
+}
+
+/// Pump one data channel to a TCP target. Sends a zero-length data-channel
+/// message (EOF marker) to the client when the connection ends or fails.
+async fn run_tcp_forward(
+    pc: Arc<PeerConnection>,
+    dc_id: u16,
+    host: String,
+    port: u16,
+    mut rx: mpsc::UnboundedReceiver<Bytes>,
+) {
+    let tcp = match TcpStream::connect(format!("{}:{}", host, port)).await {
+        Ok(tcp) => tcp,
+        Err(e) => {
+            error!("Failed to connect to {}:{}: {}", host, port, e);
+            // Tell the client this attempt failed, so it
+            // does not wait on a channel that will never
+            // carry data.
+            let _ = pc.send_data(dc_id, &[]).await;
+            return;
+        }
+    };
+
+    info!("TCP connected to {}:{}, forwarding...", host, port);
+    // Disable Nagle for interactive protocols (SSH).
+    let _ = tcp.set_nodelay(true);
+    let (mut tcp_read, mut tcp_write) = tcp.into_split();
+    let mut buf = [0u8; 1024];
+    let mut total: u64 = 0;
+
+    // Drive both directions in this one task: dropping
+    // it (on data-channel close) closes both halves of
+    // the TCP socket instead of leaking the read half.
+    loop {
+        tokio::select! {
+            read = tcp_read.read(&mut buf) => {
+                match read {
+                    Ok(0) | Err(_) => {
+                        debug!("agent tcp_read EOF (sent {} bytes total), signaling client", total);
+                        // Zero-length message = EOF marker.
+                        let _ = pc.send_data(dc_id, &[]).await;
+                        break;
+                    }
+                    Ok(n) => {
+                        total += n as u64;
+                        if pc.send_data(dc_id, &buf[..n]).await.is_err() {
                             break;
                         }
                     }
                 }
             }
-        }));
+            data = rx.recv() => {
+                match data {
+                    Some(data) => {
+                        // Zero-length data-channel message = session end
+                        // signal from the client (its local TCP closed).
+                        if data.is_empty() {
+                            debug!("agent tcp: EOF marker from client, closing target connection");
+                            break;
+                        }
+                        if tcp_write.write_all(&data).await.is_err() {
+                            debug!("agent tcp_write failed, signaling client");
+                            let _ = pc.send_data(dc_id, &[]).await;
+                            break;
+                        }
+                        if tcp_write.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                    // Data channel gone: close the target TCP
+                    // connection rather than holding it open.
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
+/// Idle time before an inactive UDP target socket is released. The client
+/// tears its session down after 60s of inactivity, so this is only a safety
+/// net for sessions whose signaling went silent without a data-channel close.
+const UDP_FORWARD_IDLE: Duration = Duration::from_secs(300);
+
+/// Pump one data channel to a UDP target. Each data-channel message is one
+/// datagram; each datagram received from the (peer-locked, connected) socket
+/// is sent back as one data-channel message. Zero-length data-channel
+/// messages mean "session ended" (from the client) or "target unreachable"
+/// (sent to the client); empty UDP datagrams are ignored.
+async fn run_udp_forward(
+    pc: Arc<PeerConnection>,
+    dc_id: u16,
+    host: String,
+    port: u16,
+    mut rx: mpsc::UnboundedReceiver<Bytes>,
+) {
+    let udp = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to bind UDP socket for {}:{}: {}", host, port, e);
+            let _ = pc.send_data(dc_id, &[]).await;
+            return;
+        }
+    };
+    // connect() locks the socket to the resolved target so replies from any
+    // other source are dropped, like a per-session NAT mapping.
+    if let Err(e) = udp.connect(format!("{}:{}", host, port)).await {
+        error!("Failed to connect UDP socket to {}:{}: {}", host, port, e);
+        let _ = pc.send_data(dc_id, &[]).await;
+        return;
     }
 
-    Ok(ActiveSession { pc: peer_connection, tasks, reliable })
+    info!("UDP socket connected to {}:{}, forwarding...", host, port);
+    let mut buf = vec![0u8; 65535];
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(UDP_FORWARD_IDLE) => {
+                debug!("UDP forward {}:{} idle for {}s, closing", host, port, UDP_FORWARD_IDLE.as_secs());
+                break;
+            }
+            data = rx.recv() => {
+                match data {
+                    Some(data) => {
+                        // Zero-length data-channel message = session end signal.
+                        if data.is_empty() {
+                            debug!("agent udp: EOF marker from client, closing session");
+                            break;
+                        }
+                        if udp.send(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Data channel gone: close the target UDP socket rather
+                    // than holding it open.
+                    None => break,
+                }
+            }
+            recv = udp.recv(&mut buf) => {
+                match recv {
+                    Ok(0) => continue,
+                    Ok(n) => {
+                        if pc.send_data(dc_id, &buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        debug!("agent udp recv error from {}:{}: {}", host, port, e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Replace the cached ICE server configuration (including temporary TURN

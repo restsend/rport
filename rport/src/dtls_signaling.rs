@@ -13,10 +13,24 @@ use tracing::{debug, info, warn};
 
 //=== Message types ===
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Target {
     pub host: Option<String>,
     pub port: u16,
+    /// Transport protocol for the forwarding target: "tcp" (default, for
+    /// backward compatibility with peers that omit the field) or "udp".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proto: Option<String>,
+}
+
+impl Target {
+    pub fn tcp(host: Option<String>, port: u16) -> Self {
+        Self { host, port, proto: None }
+    }
+
+    pub fn udp(host: Option<String>, port: u16) -> Self {
+        Self { host, port, proto: Some("udp".to_string()) }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -398,7 +412,7 @@ mod tests {
             session_id.clone(),
             "test-agent".to_string(),
             "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n".to_string(),
-            Some(vec![Target { host: Some("127.0.0.1".to_string()), port: 22 }]),
+            Some(vec![Target::tcp(Some("127.0.0.1".to_string()), 22)]),
         )).await.unwrap();
 
         let mut agent_buf = BytesMut::new();
@@ -499,7 +513,7 @@ mod tests {
                 session_id.clone(),
                 "test-agent".to_string(),
                 big_sdp.clone(),
-                Some(vec![Target { host: Some("127.0.0.1".to_string()), port: 22 }]),
+                Some(vec![Target::tcp(Some("127.0.0.1".to_string()), 22)]),
             ))
             .await
             .unwrap();

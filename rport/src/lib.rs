@@ -14,8 +14,11 @@ mod e2e_test;
 
 pub use acl::{Acl, parse_allow_rules};
 pub use agent::Agent;
-pub use client::{CliClient, ForwardStats, forward_stream_to_webrtc};
-pub use config::{ForwardMapping, IceServerConfig, RportConfig};
+pub use client::{
+    CliClient, ForwardStats, data_channel_config_for, dc_label_for, forward_stream_to_webrtc,
+    forward_udp_session,
+};
+pub use config::{ForwardMapping, IceServerConfig, Protocol, RportConfig};
 pub use dtls_signaling::{DtlsClient, DtlsAgent, SignalingMessage, Target, send_message, recv_message};
 pub use webrtc_config::WebRTCConfig;
 pub use uuid;
@@ -86,7 +89,7 @@ pub async fn async_run(cli: Cli) -> anyhow::Result<()> {
     }
 
     if is_agent_mode && is_client_mode {
-        anyhow::bail!("Cannot specify both -A (agent) and -L (client)");
+        anyhow::bail!("Cannot specify both -A (agent) and -L/-U (client)");
     }
 
     let srv = server.as_deref().ok_or_else(|| {
@@ -109,7 +112,15 @@ pub async fn async_run(cli: Cli) -> anyhow::Result<()> {
 
         let is_proxy_command = forwards.iter().any(|f| f.is_proxy_command());
         if forwards.len() > 1 && is_proxy_command {
-            anyhow::bail!("ProxyCommand mode (-L host:port) cannot be combined with other -L specs");
+            anyhow::bail!("ProxyCommand mode (-L host:port) cannot be combined with other -L/-U specs");
+        }
+        // ProxyCommand pipes stdin/stdout, which is inherently a byte
+        // stream — UDP forwarding needs a local listen port.
+        if let Some(fwd) = forwards.iter().find(|f| f.is_proxy_command() && f.proto == Protocol::Udp) {
+            anyhow::bail!(
+                "UDP forwarding requires a local port; '{}:{}' is a ProxyCommand spec",
+                fwd.host, fwd.port
+            );
         }
 
         let client = CliClient::new(srv, tok, agent_id, ice_servers, upnp, wait_candidates, &config);

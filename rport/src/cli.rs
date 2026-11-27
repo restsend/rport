@@ -21,9 +21,16 @@ pub struct Cli {
     pub id: Option<String>,
 
     //=== Client port forwarding mode ===
-    /// Forward spec: local_port:host:port (port forward) or host:port (ProxyCommand pipe mode)
+    /// Forward spec: local_port:host:port (port forward) or host:port (ProxyCommand pipe mode).
+    /// Append /udp for UDP forwarding (e.g. 5353:127.0.0.1:53/udp).
     #[arg(short = 'L', value_name = "SPEC")]
     pub forward: Vec<String>,
+
+    //=== Client UDP port forwarding mode ===
+    /// UDP forward spec: local_port:host:port (repeatable). Append /tcp to force TCP.
+    /// e.g. -U 5353:127.0.0.1:53
+    #[arg(short = 'U', value_name = "SPEC")]
+    pub forward_udp: Vec<String>,
 
     //=== Agent access control mode ===
     /// Access control rule (repeatable): port, port-port, or host:port-port

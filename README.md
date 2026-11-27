@@ -8,8 +8,9 @@ It is built on top of [rustrtc](https://github.com/restsend/rustrtc), a pure Rus
 
 - 🚀 **WebRTC-based P2P connections** - Direct peer-to-peer tunneling
 - 🔒 **Secure tunneling** - End-to-end encrypted connections over DTLS signaling + WebRTC data channels
+- 🔀 **TCP and UDP forwarding** - UDP runs over unordered, zero-retransmit data channels, preserving UDP semantics (datagram boundaries, no head-of-line blocking)
 - 📁 **Configuration file support** - TOML-based configuration with CLI override
-- 🔧 **Multiple operation modes** - Agent (`-A`), client (`-L`), and ProxyCommand modes
+- 🔧 **Multiple operation modes** - Agent (`-A`), client (`-L`/`-U`), and ProxyCommand modes
 - 🔄 **Background daemon support** - Run as a system daemon with `-d` and custom log files
 - 📊 **Structured logging** - Comprehensive logging with tracing support
 - ⚡ **High performance** - Built with Tokio async runtime
@@ -43,6 +44,26 @@ rport -L 8080:127.0.0.1:22 -i my-server -k secret-token -s your-server.com:8443
 # Now you can SSH through the tunnel
 ssh user@localhost -p 8080
 ```
+
+### 5. UDP Forwarding
+
+Append `/udp` to a `-L` spec or use `-U`:
+
+```bash
+# Forward local UDP port 5353 to remote DNS server (both syntaxes work)
+rport -L 5353:127.0.0.1:53/udp -i my-server -k secret-token -s your-server.com:8443
+rport -U 5353:127.0.0.1:53 -i my-server -k secret-token -s your-server.com:8443
+
+# Now DNS queries go through the tunnel
+dig @127.0.0.1 -p 5353 example.com
+```
+
+UDP datagrams travel over an unordered, zero-retransmit WebRTC data channel:
+each datagram stays a datagram (no artificial reliability), so real-time
+traffic and protocols with their own loss handling (DNS, QUIC, WireGuard,
+games) behave as they would on a direct link. Each local source address gets
+its own tunnel session, and idle sessions are torn down after 60 seconds.
+The agent's `-A` ACL applies to UDP targets the same way as TCP.
 
 ## SSH Integration
 
@@ -104,6 +125,7 @@ log_file = "/var/log/rport.log"
 - **Daemon Mode**: `rport -A 22 -i my-server -k token -s server.com:8443 -d --log-file rport.log`
 - **Agent ACL (multiple ports)**: `rport -A 22 -A 3000-4000 -A 127.0.0.1:8080 -i my-agent -k token -s server.com:8443`
 - **Multiple forwards**: `rport -L 8080:127.0.0.1:80 -L 2222:127.0.0.1:22 -i my-server -k token -s server.com:8443`
+- **UDP forwards**: `rport -U 5353:127.0.0.1:53 -U 1194:127.0.0.1:1194/udp -i my-server -k token -s server.com:8443`
 - **Troubleshooting**: Use `--debug` for verbose logs.
 - **NAT**: Built-in TURN server handles most NAT scenarios automatically.
 
@@ -118,7 +140,9 @@ Options:
   -s, --server <SERVER>      DTLS signaling server address (e.g. rport.example.com:8443)
   -k, --token <TOKEN>        Authentication token
   -i, --id <ID>              Agent/client identifier
-  -L <SPEC>                  Forward spec: local_port:host:port or host:port (ProxyCommand)
+  -L <SPEC>                  Forward spec: local_port:host:port or host:port (ProxyCommand);
+                             append /udp for UDP forwarding
+  -U <SPEC>                  UDP forward spec: local_port:host:port (repeatable)
   -A, --allow <RULE>         Access control rule (repeatable): port, port-port, or host:port-port
       --timeout <TIMEOUT>    Connection timeout in seconds
       --debug                Enable debug logging

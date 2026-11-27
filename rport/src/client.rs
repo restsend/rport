@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -10,16 +12,46 @@ use rustrtc::{
     IceCandidate, IceGatheringState, PeerConnection, PeerConnectionEvent, SdpType, SessionDescription,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tracing::{debug, error, info, warn};
 
-use crate::config::{ForwardMapping, IceServerConfig, RportConfig};
+use crate::config::{ForwardMapping, IceServerConfig, Protocol, RportConfig};
 use crate::dtls_signaling::{send_message, DtlsClient, SignalingMessage, Target};
 use crate::reliable::ReliableSession;
 use crate::webrtc_config::WebRTCConfig;
 use uuid::Uuid;
 
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Idle time before an inactive UDP session is torn down (and its WebRTC
+/// peer connection released). A datagram arriving after the timeout simply
+/// establishes a fresh session, mirroring NAT UDP mapping timeouts.
+const UDP_SESSION_IDLE: Duration = Duration::from_secs(60);
+
+/// Build the data-channel config for a forwarding session. UDP sessions use
+/// an unordered, zero-retransmit (PR-SCTP) channel so a lost packet behaves
+/// like real UDP (dropped) instead of stalling every later datagram behind
+/// it (head-of-line blocking). SCTP preserves message boundaries, so each
+/// datagram maps to exactly one DataChannel message.
+pub fn data_channel_config_for(label: &str, proto: Protocol) -> DataChannelConfig {
+    let mut config = DataChannelConfig {
+        ordered: true,
+        label: label.to_string(),
+        ..Default::default()
+    };
+    if proto == Protocol::Udp {
+        config.ordered = false;
+        config.max_retransmits = Some(0);
+    }
+    config
+}
+
+pub fn dc_label_for(host: &str, port: u16, proto: Protocol) -> String {
+    match proto {
+        Protocol::Tcp => format!("fwd:{}:{}", host, port),
+        Protocol::Udp => format!("fwd:udp:{}:{}", host, port),
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct ForwardStats {
@@ -190,7 +222,15 @@ where
         let mut buffer = [0u8; 1200];
         loop {
             match input.read(&mut buffer).await {
-                Ok(0) => { debug!("forward_stream_to_webrtc: input EOF"); break; }
+                Ok(0) => {
+                    debug!("forward_stream_to_webrtc: input EOF");
+                    // Symmetric EOF marker (mirror of the agent's): tells the
+                    // agent to close the target connection and reap the
+                    // session immediately instead of waiting for the ICE
+                    // disconnect threshold (~45s) to notice we are gone.
+                    let _ = pc_clone.send_data(dc_id, &[]).await;
+                    break;
+                }
                 Ok(n) => {
                     if let Some(ref s) = stats_input {
                         s.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
@@ -264,6 +304,177 @@ where
     Ok(())
 }
 
+//=== UDP session: datagrams ↔ WebRTC data channel ===
+
+/// Forward one UDP "session": datagrams arriving on `input_rx` (from the
+/// local UDP socket, all from one source address) go out over the data
+/// channel; data-channel messages are delivered back to the same source
+/// address. Each datagram maps to exactly one data-channel message.
+///
+/// The session ends on: idle timeout (no traffic in either direction for
+/// `UDP_SESSION_IDLE`), data-channel close (or a zero-length EOF marker from
+/// the agent, e.g. when it could not reach the UDP target), or WebRTC
+/// failure. `#[allow(clippy::too_many_arguments)]` mirrors the TCP variant.
+#[allow(clippy::too_many_arguments)]
+pub async fn forward_udp_session(
+    peer_connection: Arc<PeerConnection>,
+    data_channel: Arc<DataChannel>,
+    connect_timeout: Option<u32>,
+    stats: Option<Arc<ForwardStats>>,
+    label: String,
+    sock: Arc<UdpSocket>,
+    peer: SocketAddr,
+    mut input_rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    signaling_done: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    let (open_tx, open_rx) = tokio::sync::oneshot::channel();
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    let dc_closed = tokio_util::sync::CancellationToken::new();
+
+    // Drain data-channel events: replies from the agent, EOF markers and
+    // channel close.
+    let dc_clone = data_channel.clone();
+    let dc_closed_tx = dc_closed.clone();
+    let stats_dc = stats.clone();
+    tokio::spawn(async move {
+        let mut open_tx = Some(open_tx);
+        while let Some(event) = dc_clone.recv().await {
+            match event {
+                DataChannelEvent::Open => {
+                    debug!("UDP data channel Open event");
+                    if let Some(tx) = open_tx.take() { let _ = tx.send(()); }
+                }
+                DataChannelEvent::Message(data) => {
+                    if let Some(ref s) = stats_dc {
+                        s.bytes_recv.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        s.packets_recv.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = msg_tx.send(data);
+                }
+                DataChannelEvent::BufferedAmountLow(_) => {}
+                DataChannelEvent::Close => {
+                    dc_closed_tx.cancel();
+                    break;
+                }
+            }
+        }
+    });
+
+    let connect_timeout = connect_timeout.unwrap_or(30);
+    if let Err(_) = tokio::time::timeout(
+        Duration::from_secs(connect_timeout.into()),
+        open_rx,
+    ).await {
+        signaling_done.cancel();
+        peer_connection.close();
+        return Err(anyhow!("Data channel open timeout"));
+    }
+    debug!("UDP data channel is open, starting forwarding ({})", label);
+
+    // WebRTC failure monitor (same policy as the TCP forwarder).
+    const DISCONNECT_GRACE: Duration = Duration::from_secs(15);
+    let pc_monitor = peer_connection.clone();
+    let webrtc_dead = tokio_util::sync::CancellationToken::new();
+    let webrtc_dead_tx = webrtc_dead.clone();
+    tokio::spawn(async move {
+        let mut state_rx = pc_monitor.subscribe_peer_state();
+        loop {
+            if state_rx.changed().await.is_err() { return; }
+            let state = *state_rx.borrow();
+            match state {
+                rustrtc::PeerConnectionState::Failed | rustrtc::PeerConnectionState::Closed => {
+                    webrtc_dead_tx.cancel(); return;
+                }
+                rustrtc::PeerConnectionState::Disconnected => {
+                    let deadline = tokio::time::Instant::now() + DISCONNECT_GRACE;
+                    let mut recovered = false;
+                    loop {
+                        tokio::select! {
+                            changed = state_rx.changed() => {
+                                if changed.is_err() { break; }
+                                if matches!(*state_rx.borrow(), rustrtc::PeerConnectionState::Connected) {
+                                    recovered = true; break;
+                                }
+                            }
+                            _ = tokio::time::sleep_until(deadline) => { break; }
+                        }
+                    }
+                    if !recovered {
+                        webrtc_dead_tx.cancel(); return;
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let pc_send = peer_connection.clone();
+    let dc_id = data_channel.id;
+    let stats_out = stats.clone();
+    let mut closed_by_remote = false;
+    let result = loop {
+        tokio::select! {
+            // Session idle: nothing flowed in either direction recently.
+            _ = tokio::time::sleep(UDP_SESSION_IDLE) => {
+                debug!("UDP session idle ({}), closing: {}", UDP_SESSION_IDLE.as_secs(), label);
+                break Ok(());
+            }
+            _ = webrtc_dead.cancelled() => {
+                debug!("forward_udp_session: WebRTC disconnected");
+                break Ok(());
+            }
+            _ = dc_closed.cancelled() => {
+                debug!("forward_udp_session: data channel closed");
+                break Ok(());
+            }
+            datagram = input_rx.recv() => {
+                match datagram {
+                    Some(data) => {
+                        // Empty datagrams carry no meaning on this path (the
+                        // zero-length message is reserved for EOF).
+                        if data.is_empty() { continue; }
+                        if let Some(ref s) = stats_out {
+                            s.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+                            s.packets_sent.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if let Err(e) = pc_send.send_data(dc_id, &data).await {
+                            debug!("forward_udp_session: send failed: {}", e);
+                            break Ok(());
+                        }
+                    }
+                    // Local listener shut down.
+                    None => break Ok(()),
+                }
+            }
+            data = msg_rx.recv() => {
+                match data {
+                    Some(data) => {
+                        // Zero-length message = EOF marker from the agent
+                        // (e.g. UDP target unreachable).
+                        if data.is_empty() {
+                            debug!("UDP EOF marker from agent, closing session");
+                            closed_by_remote = true;
+                            break Ok(());
+                        }
+                        if let Err(e) = sock.send_to(&data, peer).await {
+                            debug!("UDP send_to {} failed: {}", peer, e);
+                            break Ok(());
+                        }
+                    }
+                    None => break Ok(()),
+                }
+            }
+        }
+    };
+
+    if closed_by_remote {
+        debug!("UDP session ended (agent closed): {}", label);
+    }
+    signaling_done.cancel();
+    peer_connection.close();
+    result
+}
+
 //=== CliClient ===
 
 pub struct CliClient {
@@ -309,7 +520,9 @@ impl CliClient {
         target_port: u16,
     ) -> Result<()> {
         info!("ProxyCommand: agent '{}' target {}:{}", self.agent_id, target_host, target_port);
-        let (pc, dc, remote_rx, signaling_done) = self.establish_webrtc(target_host, target_port).await?;
+        let (pc, dc, remote_rx, signaling_done) = self
+            .establish_webrtc(target_host, target_port, Protocol::Tcp)
+            .await?;
         forward_stream_to_webrtc(
             pc, dc, connect_timeout, None,
             format!("proxy -> {}:{}", target_host, target_port),
@@ -327,74 +540,273 @@ impl CliClient {
         let all_stats = Arc::new(ForwardStats::default());
 
         for fwd in forwards {
-            let local_port = fwd.local_port.ok_or_else(|| {
-                anyhow!("Port forward requires local port in -L spec")
-            })?;
-            let host = fwd.host.clone();
-            let port = fwd.port;
-            let webrtc_config = self.webrtc_config.clone();
-            let srv = self.server_url.clone();
-            let tok = self.token.clone();
-            let agent_id = self.agent_id.clone();
-            let stats = all_stats.clone();
-            let timeout = connect_timeout;
-            let wait_candidates = self.wait_candidates;
-
-            tokio::spawn(async move {
-                let listener = match TcpListener::bind(format!("127.0.0.1:{}", local_port)).await {
-                    Ok(l) => l,
-                    Err(e) => {
-                        error!("Failed to bind local port {}: {}", local_port, e);
-                        return;
-                    }
-                };
-                info!("Port forward: listening on localhost:{} -> agent '{}' -> {}:{}",
-                      local_port, agent_id, host, port);
-
-                loop {
-                    match listener.accept().await {
-                        Ok((tcp_stream, addr)) => {
-                            info!("New connection from {}", addr);
-                            // Disable Nagle: interactive protocols (SSH) send
-                            // small packets that must not be delayed by Nagle's
-                            // algorithm + delayed-ACK, which can stall auth.
-                            let _ = tcp_stream.set_nodelay(true);
-                            let (reader, writer) = tcp_stream.into_split();
-                            let client = CliClient {
-                                server_url: srv.clone(),
-                                token: tok.clone(),
-                                agent_id: agent_id.clone(),
-                                webrtc_config: webrtc_config.clone(),
-                                wait_candidates,
-                            };
-                            let stats = stats.clone();
-                            let host_clone = host.clone();
-                            tokio::spawn(async move {
-                                match client.establish_webrtc(&host_clone, port).await {
-                                    Ok((pc, dc, remote_rx, signaling_done)) => {
-                                        if let Err(e) = forward_stream_to_webrtc(
-                                            pc, dc, timeout, Some(stats),
-                                            format!("localhost:{} -> {}:{}", local_port, host_clone, port),
-                                            reader, writer, remote_rx, signaling_done,
-                                        ).await {
-                                            error!("Forwarding error: {}", e);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to establish WebRTC: {}", e);
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => error!("Accept error: {}", e),
-                    }
+            match fwd.proto {
+                Protocol::Tcp => {
+                    self.spawn_tcp_forward(fwd, connect_timeout, all_stats.clone());
                 }
-            });
+                Protocol::Udp => {
+                    self.spawn_udp_forward(fwd, connect_timeout, all_stats.clone());
+                }
+            }
         }
 
         // Wait forever
         std::future::pending::<()>().await;
         Ok(())
+    }
+
+    /// TCP port forward: one WebRTC session per accepted TCP connection.
+    fn spawn_tcp_forward(
+        &self,
+        fwd: &ForwardMapping,
+        connect_timeout: Option<u32>,
+        all_stats: Arc<ForwardStats>,
+    ) {
+        let local_port = fwd.local_port.unwrap_or_else(|| {
+            // spawn_* helpers are only called with port-forward mappings
+            unreachable!("TCP port forward requires a local port")
+        });
+        let host = fwd.host.clone();
+        let port = fwd.port;
+        let webrtc_config = self.webrtc_config.clone();
+        let srv = self.server_url.clone();
+        let tok = self.token.clone();
+        let agent_id = self.agent_id.clone();
+        let stats = all_stats.clone();
+        let timeout = connect_timeout;
+        let wait_candidates = self.wait_candidates;
+
+        tokio::spawn(async move {
+            // Bind loopback on both address families when available — SSH's
+            // `-L` listens on 127.0.0.1 AND ::1, and tools that resolve
+            // `localhost` (spice-gtk on macOS prefers ::1) must reach us on
+            // either stack.
+            let mut listeners = Vec::new();
+            for addr in [("127.0.0.1", local_port), ("::1", local_port)] {
+                match TcpListener::bind(addr).await {
+                    Ok(l) => listeners.push(l),
+                    Err(e) => {
+                        // IPv4 failure is fatal; IPv6 may simply be unavailable.
+                        if addr.0 == "127.0.0.1" {
+                            error!("Failed to bind local port {}: {}", local_port, e);
+                            return;
+                        }
+                        debug!("IPv6 loopback unavailable on port {}: {}", local_port, e);
+                    }
+                }
+            }
+            info!("TCP forward: listening on [localhost]:{} ({} stack(s)) -> agent '{}' -> {}:{}",
+                  local_port, listeners.len(), agent_id, host, port);
+
+            for listener in listeners {
+                let webrtc_config = webrtc_config.clone();
+                let srv = srv.clone();
+                let tok = tok.clone();
+                let agent_id = agent_id.clone();
+                let stats = stats.clone();
+                let host = host.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match listener.accept().await {
+                            Ok((tcp_stream, addr)) => {
+                                info!("New connection from {}", addr);
+                                // Disable Nagle: interactive protocols (SSH) send
+                                // small packets that must not be delayed by Nagle's
+                                // algorithm + delayed-ACK, which can stall auth.
+                                let _ = tcp_stream.set_nodelay(true);
+                                let (reader, writer) = tcp_stream.into_split();
+                                let client = CliClient {
+                                    server_url: srv.clone(),
+                                    token: tok.clone(),
+                                    agent_id: agent_id.clone(),
+                                    webrtc_config: webrtc_config.clone(),
+                                    wait_candidates,
+                                };
+                                let stats = stats.clone();
+                                let host_clone = host.clone();
+                                tokio::spawn(async move {
+                                    match client.establish_webrtc(&host_clone, port, Protocol::Tcp).await {
+                                        Ok((pc, dc, remote_rx, signaling_done)) => {
+                                            if let Err(e) = forward_stream_to_webrtc(
+                                                pc, dc, timeout, Some(stats),
+                                                format!("localhost:{} -> {}:{}", local_port, host_clone, port),
+                                                reader, writer, remote_rx, signaling_done,
+                                            ).await {
+                                                error!("Forwarding error: {}", e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to establish WebRTC: {}", e);
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => error!("Accept error: {}", e),
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// UDP port forward: datagrams from each source address are multiplexed
+    /// onto its own WebRTC session (NAT-like per-peer mapping). Sessions are
+    /// created on the first datagram from a source and torn down after an
+    /// idle period, so quiet clients do not hold ICE sockets forever.
+    fn spawn_udp_forward(
+        &self,
+        fwd: &ForwardMapping,
+        connect_timeout: Option<u32>,
+        all_stats: Arc<ForwardStats>,
+    ) {
+        let local_port = fwd.local_port.unwrap_or_else(|| {
+            unreachable!("UDP port forward requires a local port")
+        });
+        let host = fwd.host.clone();
+        let port = fwd.port;
+        let webrtc_config = self.webrtc_config.clone();
+        let srv = self.server_url.clone();
+        let tok = self.token.clone();
+        let agent_id = self.agent_id.clone();
+        let stats = all_stats.clone();
+        let timeout = connect_timeout;
+        let wait_candidates = self.wait_candidates;
+
+        tokio::spawn(async move {
+            // Mirror spawn_tcp_forward: bind loopback on both address
+            // families when available so `localhost` resolves either way.
+            let mut socks = Vec::new();
+            for addr in [("127.0.0.1", local_port), ("::1", local_port)] {
+                match UdpSocket::bind(addr).await {
+                    Ok(s) => socks.push(Arc::new(s)),
+                    Err(e) => {
+                        if addr.0 == "127.0.0.1" {
+                            error!("Failed to bind local UDP port {}: {}", local_port, e);
+                            return;
+                        }
+                        debug!("IPv6 loopback unavailable for UDP port {}: {}", local_port, e);
+                    }
+                }
+            }
+            info!("UDP forward: listening on [localhost]:{} ({} stack(s)) -> agent '{}' -> udp {}:{}",
+                  local_port, socks.len(), agent_id, host, port);
+            for sock in socks {
+                let webrtc_config = webrtc_config.clone();
+                let srv = srv.clone();
+                let tok = tok.clone();
+                let agent_id = agent_id.clone();
+                let stats = stats.clone();
+                let host = host.clone();
+                tokio::spawn(async move {
+                    Self::run_udp_listener(
+                        sock, local_port, host, port, agent_id,
+                        webrtc_config, srv, tok, wait_candidates, timeout, stats,
+                    ).await;
+                });
+            }
+        });
+    }
+
+    /// Accept loop for one UDP listen socket: datagrams from each source
+    /// address are multiplexed onto their own WebRTC session (NAT-like
+    /// per-peer mapping). Sessions are created on the first datagram from a
+    /// source and torn down after an idle period, so quiet clients do not
+    /// hold ICE sockets forever.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_udp_listener(
+        sock: Arc<UdpSocket>,
+        local_port: u16,
+        host: String,
+        port: u16,
+        agent_id: String,
+        webrtc_config: WebRTCConfig,
+        srv: String,
+        tok: String,
+        wait_candidates: bool,
+        timeout: Option<u32>,
+        stats: Arc<ForwardStats>,
+    ) {
+        // src address -> outbound datagram queue for its session
+        let mut sessions: HashMap<SocketAddr, tokio::sync::mpsc::UnboundedSender<Bytes>> =
+            HashMap::new();
+        let mut buf = vec![0u8; 65535];
+
+            loop {
+                let (n, src) = match sock.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("UDP accept error: {}", e);
+                        continue;
+                    }
+                };
+                let datagram = Bytes::copy_from_slice(&buf[..n]);
+
+                // Reuse the live session for this source; a send error means
+                // the session task has exited (idle/remote close/WebRTC
+                // failure) and a fresh one must be established.
+                let reuse = match sessions.get(&src) {
+                    Some(tx) if !tx.is_closed() => tx.send(datagram.clone()).is_ok(),
+                    _ => false,
+                };
+                if reuse {
+                    continue;
+                }
+                sessions.remove(&src);
+
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+                let _ = tx.send(datagram);
+                sessions.insert(src, tx.clone());
+
+                let client = CliClient {
+                    server_url: srv.clone(),
+                    token: tok.clone(),
+                    agent_id: agent_id.clone(),
+                    webrtc_config: webrtc_config.clone(),
+                    wait_candidates,
+                };
+                let stats = stats.clone();
+                let sock = sock.clone();
+                let host = host.clone();
+                let label = format!("localhost:{} -> udp {}:{} [{}]",
+                                    local_port, host, port, src);
+                tokio::spawn(async move {
+                    match client.establish_webrtc(&host, port, Protocol::Udp).await {
+                        Ok((pc, dc, remote_rx, signaling_done)) => {
+                            // Merge datagrams queued before the session was
+                            // ready with any that arrive while it is up, plus
+                            // messages from remote-created channels.
+                            let (merged_tx, merged_rx) =
+                                tokio::sync::mpsc::unbounded_channel::<Bytes>();
+                            let pump_in = tokio::spawn(async move {
+                                let mut rx = rx;
+                                let mut remote_rx = remote_rx;
+                                loop {
+                                    tokio::select! {
+                                        d = rx.recv() => match d {
+                                            Some(d) => { if merged_tx.send(d).is_err() { break; } }
+                                            None => { merged_tx.send(Bytes::new()).ok(); break; }
+                                        },
+                                        d = remote_rx.recv() => match d {
+                                            Some(d) => { if merged_tx.send(d).is_err() { break; } }
+                                            None => break,
+                                        },
+                                    }
+                                }
+                            });
+                            if let Err(e) = forward_udp_session(
+                                pc, dc, timeout, Some(stats), label.clone(),
+                                sock, src, merged_rx, signaling_done,
+                            ).await {
+                                debug!("UDP session error ({}): {}", label, e);
+                            }
+                            pump_in.abort();
+                        }
+                        Err(e) => {
+                            error!("Failed to establish UDP WebRTC session ({}): {}", label, e);
+                        }
+                    }
+                });
+            }
     }
 
     /// Connect to DTLS, send GetIceServers, receive response.
@@ -440,6 +852,7 @@ impl CliClient {
         &self,
         target_host: &str,
         target_port: u16,
+        proto: Protocol,
     ) -> Result<(
         Arc<PeerConnection>,
         Arc<DataChannel>,
@@ -464,12 +877,8 @@ impl CliClient {
 
         let peer_connection = self.webrtc_config.create_peer_connection_with(&extra_ice_servers).await?;
 
-        let label = format!("fwd:{}:{}", target_host, target_port);
-        let dc_config = DataChannelConfig {
-            ordered: true,
-            label: label.clone(),
-            ..Default::default()
-        };
+        let label = dc_label_for(target_host, target_port, proto);
+        let dc_config = data_channel_config_for(&label, proto);
         let data_channel = peer_connection.create_data_channel(&label, Some(dc_config))?;
 
         let (remote_msg_tx, remote_msg_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
@@ -556,61 +965,91 @@ impl CliClient {
             .to_sdp_string();
 
         info!("Sending offer for agent '{}' session {}", self.agent_id, session_id);
+        let target = match proto {
+            Protocol::Tcp => Target::tcp(Some(target_host.to_string()), target_port),
+            Protocol::Udp => Target::udp(Some(target_host.to_string()), target_port),
+        };
         dtls_client.send(&SignalingMessage::new_offer(
             session_id.clone(),
             self.agent_id.clone(),
             offer_sdp,
-            Some(vec![Target {
-                host: Some(target_host.to_string()),
-                port: target_port,
-            }]),
+            Some(vec![target]),
         )).await?;
 
         // Trickle ICE: forward gathered candidates as they arrive
-        tokio::spawn(async move {
-            if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());
-                rel.lock().unwrap().prepare_send(&mut msg, false);
-                let _ = send_message(&dtls, &msg).await;
-                return;
-            }
-            loop {
-                tokio::select! {
-                    result = candidate_rx.recv() => {
-                        match result {
-                            Ok(candidate) => {
-                                info!(
-                                    "Local ICE candidate: {} {} {} {:?}",
-                                    candidate.address, candidate.transport, candidate.priority, candidate.typ,
-                                );
-                                let mut msg = SignalingMessage::new_candidate(
-                                    sid.clone(),
-                                    candidate.to_sdp(),
-                                );
-                                rel.lock().unwrap().prepare_send(&mut msg, false);
-                                let _ = send_message(&dtls, &msg).await;
-                                if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                                    let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());
-                                    rel.lock().unwrap().prepare_send(&mut msg, false);
-                                    let _ = send_message(&dtls, &msg).await;
-                                    break;
+        {
+            let pc_candidates = peer_connection.clone();
+            // With --wait-candidates the offer SDP already carries every
+            // candidate; flushing again would send duplicates.
+            let sdp_has_all_candidates = self.wait_candidates;
+            tokio::spawn(async move {
+                // Candidates already delivered live (keyed by SDP line) so the
+                // Complete-time snapshot flush does not duplicate them.
+                let mut sent: std::collections::HashSet<String> = std::collections::HashSet::new();
+                // Never short-circuit on an already-Complete flag: when
+                // gathering finishes with a SINGLE candidate — relay-only
+                // ICE policy, where the TURN allocation completes a moment
+                // after the answer went out — Complete is observable before
+                // any candidate is drained, and dropping straight to
+                // end-of-candidates silently discards that candidate. ICE
+                // then has no remote candidate to check and the session
+                // stalls until timeout (~60% of relay-path sessions). On
+                // Complete, flush the authoritative `local_candidates()`
+                // snapshot first, then send end-of-candidates.
+                let mut gathering_done =
+                    sdp_has_all_candidates
+                        || *gathering_state_rx.borrow() == IceGatheringState::Complete;
+                while !gathering_done {
+                    tokio::select! {
+                        result = candidate_rx.recv() => {
+                            match result {
+                                Ok(candidate) => {
+                                    let sdp = candidate.to_sdp();
+                                    if sent.insert(sdp.clone()) {
+                                        info!(
+                                            "Local ICE candidate: {} {} {} {:?}",
+                                            candidate.address, candidate.transport, candidate.priority, candidate.typ,
+                                        );
+                                        let mut msg = SignalingMessage::new_candidate(
+                                            sid.clone(),
+                                            sdp,
+                                        );
+                                        rel.lock().unwrap().prepare_send(&mut msg, false);
+                                        let _ = send_message(&dtls, &msg).await;
+                                    }
+                                    gathering_done = *gathering_state_rx.borrow() == IceGatheringState::Complete;
                                 }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
-                    }
-                    _ = gathering_state_rx.changed() => {
-                        if *gathering_state_rx.borrow() == IceGatheringState::Complete {
-                            let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());
-                            rel.lock().unwrap().prepare_send(&mut msg, false);
-                            let _ = send_message(&dtls, &msg).await;
-                            break;
+                        _ = gathering_state_rx.changed() => {
+                            gathering_done = *gathering_state_rx.borrow() == IceGatheringState::Complete;
                         }
                     }
                 }
-            }
-        });
+                if !sdp_has_all_candidates {
+                    for candidate in pc_candidates.ice_transport().local_candidates() {
+                        let sdp = candidate.to_sdp();
+                        if sent.insert(sdp.clone()) {
+                            info!(
+                                "Local ICE candidate (flush): {} {} {} {:?}",
+                                candidate.address, candidate.transport, candidate.priority, candidate.typ,
+                            );
+                            let mut msg = SignalingMessage::new_candidate(
+                                sid.clone(),
+                                sdp,
+                            );
+                            rel.lock().unwrap().prepare_send(&mut msg, false);
+                            let _ = send_message(&dtls, &msg).await;
+                        }
+                    }
+                }
+                let mut msg = SignalingMessage::new_end_of_candidates(sid.clone());
+                rel.lock().unwrap().prepare_send(&mut msg, false);
+                let _ = send_message(&dtls, &msg).await;
+            });
+        }
 
         // Monitor selected ICE candidate pair — fires when a pair is nominated.
         {

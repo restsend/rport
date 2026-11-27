@@ -20,10 +20,14 @@ use rport_server::{AppState, ServerMessage};
 
 //=== Unified signaling message types (compatible with rport crate) ===
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Target {
     pub host: Option<String>,
     pub port: u16,
+    /// Transport protocol for the forwarding target: "tcp" (default) or "udp".
+    /// Must be preserved verbatim when forwarding offers to agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proto: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -819,6 +823,7 @@ mod tests {
             Some(vec![Target {
                 host: Some("127.0.0.1".to_string()),
                 port: 22,
+                proto: None,
             }]),
         )
     }
