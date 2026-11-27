@@ -73,7 +73,9 @@ jobs:
             sudo rm -rf /opt/xtools-extract
             sudo chmod -R a+rX /x-tools
             echo "/x-tools/aarch64-unknown-linux-musl/bin" >> "$GITHUB_PATH"
-            aarch64-unknown-linux-musl-gcc --version
+            # $GITHUB_PATH only takes effect for LATER steps — verify via
+            # absolute path in this one.
+            /x-tools/aarch64-unknown-linux-musl/bin/aarch64-unknown-linux-musl-gcc --version
           fi
 
       - name: Configure cargo linker
