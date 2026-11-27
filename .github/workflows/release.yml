@@ -25,9 +25,9 @@ jobs:
             strip: strip
             cross_image: ""
           - target: aarch64-unknown-linux-musl
-            cc: aarch64-linux-musl-gcc
-            linker: aarch64-linux-musl-gcc
-            strip: aarch64-linux-musl-strip
+            cc: aarch64-unknown-linux-musl-gcc
+            linker: aarch64-unknown-linux-musl-gcc
+            strip: aarch64-unknown-linux-musl-strip
             cross_image: ghcr.io/cross-rs/aarch64-unknown-linux-musl:main
     steps:
       - uses: actions/checkout@v4
@@ -51,22 +51,22 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y musl-tools
           else
-            # Pull the cross-rs aarch64-musl toolchain from ghcr.io (GitHub's
-            # CDN — fast on runners, unlike musl.cc which throttles) and overlay
-            # its /usr/local onto the runner. Extracting to the same absolute
-            # path keeps the gcc driver's internal libexec/sysroot paths valid.
-            # Extracted via tar: the image's /usr/local/man (directory) clashes
-            # with the runner's non-directory /usr/local/man — `cp -a` (even
-            # with --remove-destination) errors on that mismatch, and man
-            # pages are useless in CI anyway.
+            # cross-rs :main carries a crosstool-ng toolchain under
+            # /x-tools/<triple>/bin (NOT /usr/local) and names binaries with
+            # the full triple (aarch64-unknown-linux-musl-gcc). The image
+            # makes them visible via ENV PATH, which `docker create`+`cp`
+            # does not inherit — so copy the toolchain tree out and put its
+            # bin on PATH for the following steps.
             docker pull "${{ matrix.cross_image }}"
             cid=$(docker create "${{ matrix.cross_image }}")
-            docker cp "$cid:/usr/local" /tmp/xlocal
+            docker cp "$cid:/x-tools" /tmp/xtools
             docker rm "$cid"
-            sudo tar -C /tmp/xlocal --exclude='./man' --exclude='./share/man' -cf - . \
-              | sudo tar -C /usr/local --overwrite -xf -
-            sudo rm -rf /tmp/xlocal
-            ${{ matrix.cc }} --version
+            sudo mkdir -p /x-tools
+            sudo tar -C /tmp/xtools -cf - . | sudo tar -C /x-tools -xf -
+            sudo rm -rf /tmp/xtools
+            sudo chmod -R a+rX /x-tools
+            echo "/x-tools/aarch64-unknown-linux-musl/bin" >> "$GITHUB_PATH"
+            aarch64-unknown-linux-musl-gcc --version
           fi
 
       - name: Configure cargo linker
